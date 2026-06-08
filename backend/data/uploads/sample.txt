@@ -1,0 +1,3 @@
+New leads are synchronized into SFDC every hour.
+
+Financial records are exported from NS nightly.

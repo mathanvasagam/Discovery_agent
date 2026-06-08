@@ -1,0 +1,7 @@
+name,category,auth_method,criticality,confidence_score,evidence,source_reference
+Salesforce,CRM,OAuth2,High,0.98,Aivar Sample Company Systems Inventory Contact: [EMAIL] Sales teams manage opportunities and accounts in Salesforce CRM.,/home/mathan/projects/Discovery_Agent/backend/data/uploads/sample_company.pdf
+NetSuite,ERP,Token Based,High,0.98,Finance operations create invoices in NetSuite and process payments in Stripe.,/home/mathan/projects/Discovery_Agent/backend/data/uploads/sample_company.pdf
+Jira,Issue Tracker,API Token,Medium,0.98,Support tickets are tracked in Jira.,/home/mathan/projects/Discovery_Agent/backend/data/uploads/sample_company.pdf
+Workday,HRIS,OAuth2,High,0.98,HR onboarding begins in Workday and sends notifications to Slack.,/home/mathan/projects/Discovery_Agent/backend/data/uploads/sample_company.pdf
+Slack,Other,OAuth2,Medium,0.98,HR onboarding begins in Workday and sends notifications to Slack.,/home/mathan/projects/Discovery_Agent/backend/data/uploads/sample_company.pdf
+Stripe,Finance,API Key,High,0.98,Finance operations create invoices in NetSuite and process payments in Stripe.,/home/mathan/projects/Discovery_Agent/backend/data/uploads/sample_company.pdf

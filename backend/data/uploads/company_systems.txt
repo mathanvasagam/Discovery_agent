@@ -1,0 +1,1 @@
+Salesforce CRM manages leads. NetSuite ERP handles invoicing. Jira manages engineering tasks.

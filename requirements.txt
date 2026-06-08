@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+sqlmodel
+pydantic-settings
+typer
+requests
+python-multipart
+pdfplumber
+pytesseract
+Pillow
+PyYAML
+python-dotenv
+groq
+openpyxl
+pytest
