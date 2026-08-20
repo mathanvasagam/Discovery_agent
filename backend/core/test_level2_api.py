@@ -24,6 +24,26 @@ def client_fixture(test_engine):
         with TestClient(app) as client:
             yield client
 
+def test_create_use_case_returns_created_payload(client):
+    response = client.post(
+        "/use-cases",
+        json={
+            "title": "Invoice Sync",
+            "description": "Sync opportunities to invoices.",
+            "business_goal": "Automate invoicing.",
+            "target_systems": ["Salesforce", "NetSuite"],
+            "data_flows": [],
+            "frequency": "Daily",
+            "criticality": "High",
+        },
+    )
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["id"] is not None
+    assert payload["title"] == "Invoice Sync"
+    assert payload["target_systems"] == ["Salesforce", "NetSuite"]
+
+
 def test_discover_goals_endpoint_fallback(client):
     # Test discovery when no documents or inventory exist (should return default use cases)
     response = client.post("/use-cases/discover")
@@ -31,7 +51,7 @@ def test_discover_goals_endpoint_fallback(client):
     data = response.json()
     assert "use_cases" in data
     assert len(data["use_cases"]) >= 2
-    
+
     titles = [uc["title"] for uc in data["use_cases"]]
     assert "Invoice Automation" in titles
     assert "Customer Profile Sync" in titles

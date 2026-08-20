@@ -46,25 +46,21 @@ def call_gemini(prompt: str, response_mime_type: str = "application/json") -> An
                     match = re.search(r"(\[.*\]|\{.*\})", clean_content, re.DOTALL)
                     if match:
                         try:
-                            # 3. Try to fix escaped newlines that are literal newlines
-                            fixed_json = match.group(1).replace("\n", "\\n").replace("\r", "\\r")
-                            # But wait, literal newlines are often what breaks JSON.loads
-                            # Let's try a more surgical approach
                             return json.loads(match.group(1))
                         except json.JSONDecodeError:
-                            # Last resort: try to remove literal control characters
-                            import string
-                            # Remove control characters except for space and common printable chars
-                            s = "".join(ch for ch in match.group(1) if ch.isprintable() or ch in "\n\r\t")
+                            # Last resort: remove non-printable control characters and parse again.
+                            sanitized = "".join(
+                                ch for ch in match.group(1) if ch.isprintable() or ch in "\n\r\t"
+                            )
                             try:
-                                  return json.loads(s)
-                            except:
-                                  pass
+                                return json.loads(sanitized)
+                            except json.JSONDecodeError:
+                                pass
                         raise
             return content
             
-    except Exception as e:
-        logger.error(f"Error calling {provider}: {e}")
+    except Exception as exc:
+        logger.error("Error calling %s: %s", provider, exc)
         return None
     
     return None

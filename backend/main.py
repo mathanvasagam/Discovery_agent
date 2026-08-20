@@ -5,11 +5,12 @@ sys.path.append(str(Path(__file__).parent))
 
 import csv
 import json
-import shutil
+import os
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +54,14 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv("DISCOVERY_CORS_ORIGINS", "http://localhost:5173").split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -294,15 +299,40 @@ async def dashboard() -> Dict[str, Any]:
 
 @app.post("/documents/upload", status_code=201)
 async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
-    destination = settings.uploads_dir / file.filename
-    with destination.open("wb") as handle:
-        shutil.copyfileobj(file.file, handle)
+    safe_filename = Path((file.filename or "upload.bin").replace("\\", "/")).name
+    suffix = Path(safe_filename).suffix.lower()
+    allowed_extensions = {
+        ".pdf", ".txt", ".md", ".markdown", ".csv", ".docx", ".xlsx",
+        ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp",
+    }
+    if safe_filename in {"", ".", ".."} or suffix not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Unsupported or invalid upload filename")
+
+    destination = settings.uploads_dir / safe_filename
+    if destination.exists():
+        destination = settings.uploads_dir / f"{Path(safe_filename).stem}_{uuid4().hex[:8]}{suffix}"
+
+    max_upload_bytes = int(os.getenv("DISCOVERY_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+    size_bytes = 0
+    try:
+        with destination.open("wb") as handle:
+            while chunk := await file.read(1024 * 1024):
+                size_bytes += len(chunk)
+                if size_bytes > max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="Uploaded file exceeds the configured size limit")
+                handle.write(chunk)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
     with Session(engine) as session:
         document = DocumentRecord(
-            filename=file.filename,
+            filename=safe_filename,
             stored_path=str(destination),
             content_type=file.content_type or "application/octet-stream",
-            size_bytes=destination.stat().st_size,
+            size_bytes=size_bytes,
         )
         session.add(document)
         session.commit()
@@ -418,6 +448,7 @@ async def create_use_case(payload: UseCaseCreate) -> Dict[str, Any]:
         session.add(use_case)
         session.commit()
         session.refresh(use_case)
+        return _use_case_payload(use_case)
 
 
 @app.get("/use-cases")

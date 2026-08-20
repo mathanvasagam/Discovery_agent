@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useState } from 'react'
+import { useCallback, useDeferredValue, useEffect, useState } from 'react'
 import { api } from './services/api'
 import type {
   DashboardSummary,
@@ -39,6 +39,8 @@ const GEN_STEPS: ActivityStep[] = [
   { id: 'agentgen', label: 'Generating agent definition', status: 'pending' },
   { id: 'validate', label: 'Validating production-readiness', status: 'pending' },
 ]
+
+const ARTIFACT_TABS = ['code', 'tests', 'readme'] as const
 
 const PAGES: Array<{ key: PageKey; label: string; description: string }> = [
   { key: 'dashboard', label: 'Dashboard', description: 'Overview of system discovery and health.' },
@@ -113,7 +115,7 @@ function App() {
 
   const categories = Array.from(new Set(inventory.items.map((item) => item.category))).sort()
 
-  async function refreshDashboard() {
+  const refreshDashboard = useCallback(async () => {
     try {
       const [dashboardData, reportsData, useCaseData] = await Promise.all([
         api.getDashboard(),
@@ -123,46 +125,44 @@ function App() {
       setDashboard(dashboardData)
       setReports(reportsData)
       setUseCases(useCaseData)
-      if (!selectedUseCaseId && useCaseData.length > 0) {
-        setSelectedUseCaseId(useCaseData[0].id)
-      }
-    } catch (e) {
-      console.error(e)
+      setSelectedUseCaseId((current) => current ?? (useCaseData.length > 0 ? useCaseData[0].id : null))
+    } catch (error) {
+      console.error(error)
     }
-  }
+  }, [])
 
-  async function refreshInventory() {
+  const refreshInventory = useCallback(async () => {
     try {
       const response = await api.getInventory({
         search: deferredSearch,
         category: categoryFilter,
       })
       setInventory(response)
-    } catch (e) {
-      console.error(e)
+    } catch (error) {
+      console.error(error)
     }
-  }
+  }, [categoryFilter, deferredSearch])
 
   useEffect(() => {
-    const load = async () => {
+    const loadDashboard = async () => {
       setIsBusy(true)
       setApiError('')
       try {
-        await Promise.all([refreshDashboard(), refreshInventory()])
+        await refreshDashboard()
       } catch (error) {
         setApiError(error instanceof Error ? error.message : 'Unable to reach backend API.')
       } finally {
         setIsBusy(false)
       }
     }
-    load()
-  }, [])
+    void loadDashboard()
+  }, [refreshDashboard])
 
   useEffect(() => {
-    refreshInventory().catch((error) => {
+    void refreshInventory().catch((error) => {
       setApiError(error instanceof Error ? error.message : 'Unable to refresh inventory.')
     })
-  }, [deferredSearch, categoryFilter])
+  }, [refreshInventory])
 
   useEffect(() => {
     if (!selectedUseCaseId) {
@@ -176,15 +176,12 @@ function App() {
       })
   }, [selectedUseCaseId])
 
-  const isTesting = typeof window !== 'undefined' && ((window as any).__vitest_worker__ || navigator.userAgent.includes('jsdom'));
+  function startActivity(steps: ActivityStep[]) {
+    setActivitySteps(steps.map((step) => ({ ...step, status: 'active' })))
+  }
 
-  async function runActivitySimulation(steps: ActivityStep[]) {
-    setActivitySteps(steps.map(s => ({ ...s, status: 'pending' })))
-    for (let i = 0; i < steps.length; i++) {
-      setActivitySteps(prev => prev.map((s, idx) => i === idx ? { ...s, status: 'active' } : s))
-      await new Promise(r => setTimeout(r, isTesting ? 1 : 600 + Math.random() * 800))
-      setActivitySteps(prev => prev.map((s, idx) => i === idx ? { ...s, status: 'done' } : s))
-    }
+  function completeActivity() {
+    setActivitySteps((steps) => steps.map((step) => ({ ...step, status: 'done' })))
   }
 
   async function handleUpload() {
@@ -192,17 +189,13 @@ function App() {
     setIsBusy(true)
     setApiError('')
     try {
-      // Start simulation in parallel with real call
-      const simulation = runActivitySimulation(INITIAL_STEPS)
-      const apiCall = api.uploadDocument(selectedFile)
-
-      const [_, result] = await Promise.all([simulation, apiCall])
+      startActivity(INITIAL_STEPS)
+      const result = await api.uploadDocument(selectedFile)
+      completeActivity()
 
       setStatusMessage(`Uploaded ${result.document.filename}. Discovered ${result.systems.length} systems.`)
       await Promise.all([refreshDashboard(), refreshInventory()])
       setSelectedFile(null)
-      // Small delay to let user see "Done"
-      await new Promise(r => setTimeout(r, isTesting ? 1 : 500))
       setActivitySteps([])
       setActivePage('inventory')
     } catch (error) {
@@ -217,8 +210,8 @@ function App() {
     setIsBusy(true)
     setApiError('')
     try {
-      const simulation = runActivitySimulation(GAP_STEPS)
-      const apiCall = api.createUseCase({
+      startActivity(GAP_STEPS)
+      const created = await api.createUseCase({
         title: useCaseForm.title,
         description: useCaseForm.description,
         business_goal: useCaseForm.business_goal,
@@ -226,15 +219,13 @@ function App() {
         frequency: useCaseForm.frequency,
         criticality: useCaseForm.criticality,
       })
-
-      const [_, created] = await Promise.all([simulation, apiCall])
+      completeActivity()
 
       setSelectedUseCaseId(created.id)
       setStatusMessage(`Created use case: ${created.title}`)
       await refreshDashboard()
       const report = await api.getGapReport(created.id)
       setGapReport(report)
-      await new Promise(r => setTimeout(r, isTesting ? 1 : 500))
       setActivitySteps([])
       setActivePage('gaps')
     } catch (error) {
@@ -249,14 +240,11 @@ function App() {
     setIsBusy(true)
     setApiError('')
     try {
-      const simulation = runActivitySimulation([
-        { id: 'scan', label: 'Scanning uploaded documents...', status: 'active' },
-        { id: 'extract', label: 'Extracting potential use cases...', status: 'pending' },
-        { id: 'map', label: 'Mapping systems & data flows...', status: 'pending' }
+      startActivity([
+        { id: 'discover-goals', label: 'Discovering automation goals from uploaded documents', status: 'active' },
       ])
-      const apiCall = api.discoverGoals()
-
-      const [_, result] = await Promise.all([simulation, apiCall])
+      const result = await api.discoverGoals()
+      completeActivity()
 
       const cases = await api.getUseCases()
       setUseCases(cases)
@@ -272,7 +260,6 @@ function App() {
       }
 
       await refreshDashboard()
-      await new Promise(r => setTimeout(r, isTesting ? 1 : 500))
       setActivitySteps([])
     } catch (error) {
       setApiError(error instanceof Error ? error.message : 'Could not discover goals.')
@@ -286,15 +273,13 @@ function App() {
     setIsBusy(true)
     setApiError('')
     try {
-      const simulation = runActivitySimulation(GEN_STEPS)
-      const apiCall = api.generateConnector(generatorForm)
-
-      const [_, result] = await Promise.all([simulation, apiCall])
+      startActivity(GEN_STEPS)
+      const result = await api.generateConnector(generatorForm)
+      completeActivity()
 
       setGeneratedPackage(result)
       setStatusMessage(`Generated ${result.connector.filename} with ${result.validation.status.toUpperCase()} validation`)
       await refreshDashboard()
-      await new Promise(r => setTimeout(r, isTesting ? 1 : 500))
       setActivitySteps([])
       setActivePage('generation')
     } catch (error) {
@@ -312,7 +297,7 @@ function App() {
       await api.clearInventory()
       setStatusMessage('Inventory cleared.')
       await Promise.all([refreshDashboard(), refreshInventory()])
-    } catch (error) {
+    } catch {
       setApiError('Failed to clear inventory.')
     } finally {
       setIsBusy(false)
@@ -768,11 +753,11 @@ function App() {
                   </div>
 
                   <div className="flex gap-1 border-b mb-4">
-                    {['code', 'tests', 'readme'].map(tab => (
+                    {ARTIFACT_TABS.map((tab) => (
                       <button
                         key={tab}
                         className={`nav-link ${activeTab === tab ? 'active' : ''}`}
-                        onClick={() => setActiveTab(tab as any)}
+                        onClick={() => setActiveTab(tab)}
                         style={{ padding: '0.5rem 1rem', fontSize: '0.8rem' }}
                       >
                         {tab.toUpperCase()}

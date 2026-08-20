@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     reports_dir: Path = BASE_DIR / "data" / "reports"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
-    demo_mode: bool = True
+    demo_mode: bool = False
     gemini_api_key: Optional[str] = None
     groq_api_key: Optional[str] = None
 
