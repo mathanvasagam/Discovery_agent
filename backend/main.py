@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
 import csv
+import io
 import json
 import os
 import logging
@@ -14,12 +15,14 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
+from sqlalchemy import inspect, text
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from core.code_gen import generate_agent_definition, generate_connector
+from core.code_generation_provider import generate_agent_definition, generate_connector
 from core.extractor import extract_inventory
 from core.ingestor import ingest_document
 from core.mapping_engine import map_use_case_to_inventory
@@ -36,37 +39,96 @@ from models import (
     ValidationRun,
 )
 from core.redactor import redact_chunks
+from core.provider_router import call_llm, get_llm_status, verify_llm_connection, verify_provider_connection
 from core.sandbox import validate_code_in_sandbox
+from core.security import security_middleware
 from settings import settings
 
 
+settings.validate_runtime()
 settings.ensure_directories()
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, echo=False, connect_args=connect_args)
+
+database_url = settings.database_url
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif database_url.startswith("postgresql://"):
+    database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+if database_url.startswith("postgresql+psycopg://"):
+    # Supabase's transaction pooler does not support client-side prepared statements.
+    connect_args["prepare_threshold"] = None
+engine = create_engine(database_url, echo=False, connect_args=connect_args, pool_pre_ping=True)
+FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     create_db_and_tables()
+    ensure_compatibility_columns()
     yield
 
 
-app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
+)
+trusted_hosts = list(settings.parsed_allowed_hosts)
+if not settings.is_production and "testserver" not in trusted_hosts:
+    trusted_hosts.append("testserver")
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts or ["*"])
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in os.getenv("DISCOVERY_CORS_ORIGINS", "http://localhost:5173").split(",")
-        if origin.strip()
-    ],
+    allow_origins=settings.parsed_cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
+app.middleware("http")(security_middleware)
 
 
 def create_db_and_tables() -> None:
     SQLModel.metadata.create_all(engine)
+
+
+def ensure_compatibility_columns() -> None:
+    """Add deployment-era columns to existing local databases without requiring a migration tool."""
+    schema = {
+        "usecase": {"workspace_id": "VARCHAR NOT NULL DEFAULT 'default'"},
+        "documentrecord": {
+            "workspace_id": "VARCHAR NOT NULL DEFAULT 'default'",
+            "extracted_text": "TEXT NOT NULL DEFAULT ''",
+            "retained": "BOOLEAN NOT NULL DEFAULT TRUE",
+        },
+        "inventorysystem": {"workspace_id": "VARCHAR NOT NULL DEFAULT 'default'"},
+        "gapreportrecord": {"workspace_id": "VARCHAR NOT NULL DEFAULT 'default'"},
+        "generatedartifact": {"workspace_id": "VARCHAR NOT NULL DEFAULT 'default'"},
+        "validationrun": {"workspace_id": "VARCHAR NOT NULL DEFAULT 'default'"},
+    }
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as connection:
+        for table_name, additions in schema.items():
+            if table_name not in existing_tables:
+                continue
+            existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, definition in additions.items():
+                if column_name not in existing_columns:
+                    connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
+            if "workspace_id" in additions:
+                connection.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table_name}_workspace_id ON {table_name} (workspace_id)"))
+
+
+def _workspace_id(request: Request) -> str:
+    return getattr(request.state, "workspace_id", "default")
+
+
+def _workspace_select(model, workspace_id: str):
+    return select(model).where(model.workspace_id == workspace_id)
 
 
 def _slugify(name: str) -> str:
@@ -77,12 +139,16 @@ def _persist_inventory(
     session: Session,
     systems: List[Dict[str, Any]],
     document_id: Optional[int] = None,
+    workspace_id: str = "default",
 ) -> List[InventorySystem]:
     stored: List[InventorySystem] = []
     for system in systems:
         # Check for existing system
         existing = session.exec(
-            select(InventorySystem).where(InventorySystem.name.ilike(system["name"]))
+            select(InventorySystem).where(
+                InventorySystem.workspace_id == workspace_id,
+                InventorySystem.name.ilike(system["name"]),
+            )
         ).first()
 
         new_evidence = system.get("evidence", "")
@@ -127,6 +193,7 @@ def _persist_inventory(
         else:
             # Create new record
             record = InventorySystem(
+                workspace_id=workspace_id,
                 name=system["name"],
                 category=system["category"],
                 auth_method=system["auth_method"],
@@ -187,22 +254,37 @@ def _use_case_payload(use_case: UseCase) -> Dict[str, Any]:
     }
 
 
-def discover_systems_from_file(file_path: str, content_type: Optional[str] = None) -> List[Dict[str, Any]]:
+def process_document(file_path: str, content_type: Optional[str] = None) -> tuple[List[Dict[str, Any]], str]:
     chunks = ingest_document(file_path, content_type=content_type)
     if not chunks:
-        return []
+        return [], ""
     redacted = redact_chunks(chunks)
-    return extract_inventory(redacted)
+    redacted_text = "\n".join(str(chunk.get("content", "")) for chunk in redacted)
+    redacted_text = redacted_text[: settings.max_persisted_text_chars]
+    return extract_inventory(redacted), redacted_text
 
 
-def get_gap_report(use_case_id: int, inventory: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def discover_systems_from_file(file_path: str, content_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    systems, _ = process_document(file_path, content_type=content_type)
+    return systems
+
+
+def get_gap_report(
+    use_case_id: int,
+    inventory: Optional[List[Dict[str, Any]]] = None,
+    workspace_id: str = "default",
+) -> Dict[str, Any]:
     with Session(engine) as session:
-        use_case = session.get(UseCase, use_case_id)
+        use_case = session.exec(
+            select(UseCase).where(UseCase.id == use_case_id, UseCase.workspace_id == workspace_id)
+        ).first()
         if not use_case:
             raise HTTPException(status_code=404, detail="Use case not found")
-        inventory_rows = inventory if inventory is not None else [_inventory_payload(row) for row in session.exec(select(InventorySystem)).all()]
+        inventory_rows = inventory if inventory is not None else [
+            _inventory_payload(row) for row in session.exec(_workspace_select(InventorySystem, workspace_id)).all()
+        ]
         report = map_use_case_to_inventory(_use_case_payload(use_case), inventory_rows)
-        session.add(GapReportRecord(use_case_id=use_case_id, report_json=report))
+        session.add(GapReportRecord(workspace_id=workspace_id, use_case_id=use_case_id, report_json=report))
         session.commit()
         return report
 
@@ -215,8 +297,8 @@ def _artifact_output_paths(artifact_dir: Path, connector: Dict[str, Any]) -> Dic
     return {"code": code_path, "tests": tests_path, "readme": readme_path}
 
 
-def _write_generated_artifact(connector: Dict[str, Any]) -> Path:
-    artifact_dir = settings.generated_dir / f"{_slugify(connector['filename'])}"
+def _write_generated_artifact(connector: Dict[str, Any], workspace_id: str = "default") -> Path:
+    artifact_dir = settings.generated_dir / workspace_id / f"{_slugify(connector['filename'])}"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     output_paths = _artifact_output_paths(artifact_dir, connector)
     output_paths["code"].write_text(connector["code"], encoding="utf-8")
@@ -227,14 +309,19 @@ def _write_generated_artifact(connector: Dict[str, Any]) -> Path:
     return artifact_dir
 
 
-def generate_automation_package(gap_entry: Dict[str, Any], language: str = "python") -> Dict[str, Any]:
+def generate_automation_package(
+    gap_entry: Dict[str, Any],
+    language: str = "python",
+    workspace_id: str = "default",
+) -> Dict[str, Any]:
     connector = generate_connector(gap_entry, language=language)
-    artifact_dir = _write_generated_artifact(connector)
+    artifact_dir = _write_generated_artifact(connector, workspace_id=workspace_id)
     agent_definition = generate_agent_definition(gap_entry)
     validation = validate_code_in_sandbox(connector)
 
     with Session(engine) as session:
         artifact_record = GeneratedArtifact(
+            workspace_id=workspace_id,
             system_name=gap_entry.get("system_name", "Unknown"),
             language=connector["language"],
             filename=connector["filename"],
@@ -250,6 +337,7 @@ def generate_automation_package(gap_entry: Dict[str, Any], language: str = "pyth
         session.refresh(artifact_record)
         session.add(
             ValidationRun(
+                workspace_id=workspace_id,
                 artifact_id=artifact_record.id,
                 filename=connector["filename"],
                 language=connector["language"],
@@ -268,19 +356,51 @@ def generate_automation_package(gap_entry: Dict[str, Any], language: str = "pyth
 
 
 @app.get("/health")
-async def health() -> Dict[str, str]:
-    return {"status": "healthy"}
+async def health() -> Dict[str, Any]:
+    try:
+        with Session(engine) as session:
+            session.exec(text("SELECT 1"))
+    except Exception as exc:
+        logger.error("Database health check failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return {"status": "healthy", "llm": get_llm_status(), "runtime": settings.runtime_status()}
+
+
+@app.get("/ready")
+async def readiness() -> Dict[str, Any]:
+    with Session(engine) as session:
+        session.exec(text("SELECT 1"))
+    return {"status": "ready"}
+
+
+@app.post("/integrations/llm/verify")
+async def verify_llm_integration() -> Dict[str, Any]:
+    """Verify configured providers in failover order and return the first healthy provider."""
+    return verify_llm_connection()
+
+
+@app.post("/integrations/groq/verify")
+async def verify_groq_integration() -> Dict[str, Any]:
+    """Validate only the configured Groq provider."""
+    return verify_provider_connection("groq")
+
+
+@app.post("/integrations/gemini/verify")
+async def verify_gemini_integration() -> Dict[str, Any]:
+    """Validate only the configured Gemini provider."""
+    return verify_provider_connection("gemini")
 
 
 @app.get("/dashboard")
-async def dashboard() -> Dict[str, Any]:
+async def dashboard(request: Request) -> Dict[str, Any]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        documents = session.exec(select(DocumentRecord)).all()
-        systems = session.exec(select(InventorySystem)).all()
-        use_cases = session.exec(select(UseCase)).all()
-        artifacts = session.exec(select(GeneratedArtifact)).all()
-        validations = session.exec(select(ValidationRun)).all()
-        gap_reports = session.exec(select(GapReportRecord)).all()
+        documents = session.exec(_workspace_select(DocumentRecord, workspace_id)).all()
+        systems = session.exec(_workspace_select(InventorySystem, workspace_id)).all()
+        use_cases = session.exec(_workspace_select(UseCase, workspace_id)).all()
+        artifacts = session.exec(_workspace_select(GeneratedArtifact, workspace_id)).all()
+        validations = session.exec(_workspace_select(ValidationRun, workspace_id)).all()
+        gap_reports = session.exec(_workspace_select(GapReportRecord, workspace_id)).all()
 
         total_gaps = sum(len([g for g in r.report_json.get("gaps", []) if g.get("status") == "missing"]) for r in gap_reports)
         avg_conf = sum(s.confidence_score for s in systems) / len(systems) if systems else 0.0
@@ -298,7 +418,8 @@ async def dashboard() -> Dict[str, Any]:
 
 
 @app.post("/documents/upload", status_code=201)
-async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
+async def upload_document(request: Request, file: UploadFile = File(...)) -> Dict[str, Any]:
+    workspace_id = _workspace_id(request)
     safe_filename = Path((file.filename or "upload.bin").replace("\\", "/")).name
     suffix = Path(safe_filename).suffix.lower()
     allowed_extensions = {
@@ -308,11 +429,13 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     if safe_filename in {"", ".", ".."} or suffix not in allowed_extensions:
         raise HTTPException(status_code=400, detail="Unsupported or invalid upload filename")
 
-    destination = settings.uploads_dir / safe_filename
+    workspace_uploads = settings.uploads_dir / workspace_id
+    workspace_uploads.mkdir(parents=True, exist_ok=True)
+    destination = workspace_uploads / safe_filename
     if destination.exists():
-        destination = settings.uploads_dir / f"{Path(safe_filename).stem}_{uuid4().hex[:8]}{suffix}"
+        destination = workspace_uploads / f"{Path(safe_filename).stem}_{uuid4().hex[:8]}{suffix}"
 
-    max_upload_bytes = int(os.getenv("DISCOVERY_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+    max_upload_bytes = settings.max_upload_bytes
     size_bytes = 0
     try:
         with destination.open("wb") as handle:
@@ -327,41 +450,56 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     finally:
         await file.close()
 
-    with Session(engine) as session:
-        document = DocumentRecord(
-            filename=safe_filename,
-            stored_path=str(destination),
-            content_type=file.content_type or "application/octet-stream",
-            size_bytes=size_bytes,
-        )
-        session.add(document)
-        session.commit()
-        session.refresh(document)
+    try:
+        systems, extracted_text = process_document(str(destination), content_type=file.content_type)
+        retained_path = str(destination) if settings.retain_uploads else ""
+        with Session(engine) as session:
+            document = DocumentRecord(
+                workspace_id=workspace_id,
+                filename=safe_filename,
+                stored_path=retained_path,
+                content_type=file.content_type or "application/octet-stream",
+                size_bytes=size_bytes,
+                extracted_text=extracted_text,
+                retained=settings.retain_uploads,
+            )
+            session.add(document)
+            session.commit()
+            session.refresh(document)
+            stored_systems = _persist_inventory(
+                session,
+                systems,
+                document_id=document.id,
+                workspace_id=workspace_id,
+            )
 
-        systems = discover_systems_from_file(str(destination), content_type=file.content_type)
-        stored_systems = _persist_inventory(session, systems, document_id=document.id)
-
-        return {
-            "document": {
-                "id": document.id,
-                "filename": document.filename,
-                "content_type": document.content_type,
-                "size_bytes": document.size_bytes,
-            },
-            "systems": [_inventory_payload(system) for system in stored_systems],
-        }
+            return {
+                "document": {
+                    "id": document.id,
+                    "filename": document.filename,
+                    "content_type": document.content_type,
+                    "size_bytes": document.size_bytes,
+                    "retained": document.retained,
+                },
+                "systems": [_inventory_payload(system) for system in stored_systems],
+            }
+    finally:
+        if not settings.retain_uploads:
+            destination.unlink(missing_ok=True)
 
 
 @app.get("/documents")
-async def list_documents() -> List[Dict[str, Any]]:
+async def list_documents(request: Request) -> List[Dict[str, Any]]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        documents = session.exec(select(DocumentRecord)).all()
+        documents = session.exec(_workspace_select(DocumentRecord, workspace_id)).all()
         return [
             {
                 "id": document.id,
                 "filename": document.filename,
                 "content_type": document.content_type,
                 "size_bytes": document.size_bytes,
+                "retained": document.retained,
                 "created_at": document.created_at.isoformat(),
             }
             for document in documents
@@ -370,15 +508,17 @@ async def list_documents() -> List[Dict[str, Any]]:
 
 @app.get("/inventory")
 async def list_inventory(
+    request: Request,
     search: str = "",
     category: str = "",
     criticality: str = "",
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> Dict[str, Any]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
         # Sort by ID descending so newest items are first
-        statement = select(InventorySystem).order_by(InventorySystem.id.desc())
+        statement = _workspace_select(InventorySystem, workspace_id).order_by(InventorySystem.id.desc())
         rows = session.exec(statement).all()
         items = [_inventory_payload(row) for row in rows]
 
@@ -399,42 +539,53 @@ async def list_inventory(
 
 
 @app.delete("/inventory", status_code=204)
-async def clear_inventory():
+async def clear_inventory(request: Request):
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        session.exec(SQLModel.metadata.tables["inventorysystem"].delete())
+        table = SQLModel.metadata.tables["inventorysystem"]
+        session.exec(table.delete().where(table.c.workspace_id == workspace_id))
         session.commit()
     return None
 
 
 @app.get("/inventory/export/json")
-async def export_inventory_json() -> FileResponse:
+async def export_inventory_json(request: Request) -> Response:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        items = [_inventory_payload(row) for row in session.exec(select(InventorySystem)).all()]
-    output_path = settings.reports_dir / "inventory_export.json"
-    output_path.write_text(json.dumps(items, indent=2), encoding="utf-8")
-    return FileResponse(output_path, media_type="application/json", filename="inventory_export.json")
+        items = [_inventory_payload(row) for row in session.exec(_workspace_select(InventorySystem, workspace_id)).all()]
+    return Response(
+        content=json.dumps(items, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="inventory_export.json"'},
+    )
 
 
 @app.get("/inventory/export/csv")
-async def export_inventory_csv() -> FileResponse:
+async def export_inventory_csv(request: Request) -> Response:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        items = [_inventory_payload(row) for row in session.exec(select(InventorySystem)).all()]
-    output_path = settings.reports_dir / "inventory_export.csv"
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["name", "category", "auth_method", "criticality", "confidence_score", "evidence", "source_reference"],
-        )
-        writer.writeheader()
-        for item in items:
-            writer.writerow({key: item.get(key, "") for key in writer.fieldnames})
-    return FileResponse(output_path, media_type="text/csv", filename="inventory_export.csv")
+        items = [_inventory_payload(row) for row in session.exec(_workspace_select(InventorySystem, workspace_id)).all()]
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=["name", "category", "auth_method", "criticality", "confidence_score", "evidence", "source_reference"],
+    )
+    writer.writeheader()
+    for item in items:
+        writer.writerow({key: item.get(key, "") for key in writer.fieldnames})
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="inventory_export.csv"'},
+    )
 
 
 @app.post("/use-cases", status_code=201)
-async def create_use_case(payload: UseCaseCreate) -> Dict[str, Any]:
+async def create_use_case(request: Request, payload: UseCaseCreate) -> Dict[str, Any]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
         use_case = UseCase(
+        workspace_id=workspace_id,
         title=payload.title,
         description=payload.description,
         business_goal=payload.business_goal,
@@ -452,23 +603,30 @@ async def create_use_case(payload: UseCaseCreate) -> Dict[str, Any]:
 
 
 @app.get("/use-cases")
-async def list_use_cases() -> List[Dict[str, Any]]:
+async def list_use_cases(request: Request) -> List[Dict[str, Any]]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        return [_use_case_payload(row) for row in session.exec(select(UseCase)).all()]
+        return [_use_case_payload(row) for row in session.exec(_workspace_select(UseCase, workspace_id)).all()]
 
 
 @app.post("/use-cases/discover", status_code=200)
-async def discover_goals() -> Dict[str, Any]:
+async def discover_goals(request: Request) -> Dict[str, Any]:
+    workspace_id = _workspace_id(request)
     text_content = ""
     with Session(engine) as session:
-        documents = session.exec(select(DocumentRecord)).all()
+        documents = session.exec(_workspace_select(DocumentRecord, workspace_id)).all()
         for doc in documents:
-            try:
-                chunks = ingest_document(doc.stored_path, content_type=doc.content_type)
-                if chunks:
-                    text_content += "\n" + "\n".join(c["content"] for c in chunks if "content" in c)
-            except Exception as e:
-                logger.error(f"Error reading document {doc.filename} during goal discovery: {e}")
+            if doc.extracted_text:
+                text_content += "\n" + doc.extracted_text
+                continue
+            if doc.retained and doc.stored_path:
+                try:
+                    chunks = ingest_document(doc.stored_path, content_type=doc.content_type)
+                    if chunks:
+                        redacted_chunks = redact_chunks(chunks)
+                        text_content += "\n" + "\n".join(c["content"] for c in redacted_chunks if "content" in c)
+                except Exception as exc:
+                    logger.error("Error reading retained document %s during goal discovery: %s", doc.filename, exc)
         
         text_content = text_content[:10000].strip()
 
@@ -484,8 +642,7 @@ async def discover_goals() -> Dict[str, Any]:
                 "Return the output STRICTLY as a JSON object with a single key 'use_cases' containing the list of objects."
             )
             try:
-                from core.llm import call_gemini
-                res = call_gemini(prompt, response_mime_type="application/json")
+                res = call_llm(prompt, response_mime_type="application/json")
                 if res and isinstance(res, dict) and "use_cases" in res:
                     discovered = res["use_cases"]
             except Exception as e:
@@ -511,7 +668,7 @@ async def discover_goals() -> Dict[str, Any]:
 
         if not discovered:
             discovered = []
-            inventory = [_inventory_payload(row) for row in session.exec(select(InventorySystem)).all()]
+            inventory = [_inventory_payload(row) for row in session.exec(_workspace_select(InventorySystem, workspace_id)).all()]
             system_names = [sys["name"] for sys in inventory]
             
             has_crm = any(x in [s.lower() for s in system_names] for x in ["salesforce", "hubspot", "pipedrive", "crm"])
@@ -565,9 +722,12 @@ async def discover_goals() -> Dict[str, Any]:
 
         inserted_payloads = []
         for item in discovered:
-            exists = session.exec(select(UseCase).where(UseCase.title == item["title"])).first()
+            exists = session.exec(
+                select(UseCase).where(UseCase.workspace_id == workspace_id, UseCase.title == item["title"])
+            ).first()
             if not exists:
                 use_case = UseCase(
+                    workspace_id=workspace_id,
                     title=item["title"],
                     description=item["description"],
                     business_goal=item["description"],
@@ -588,9 +748,11 @@ async def discover_goals() -> Dict[str, Any]:
 
 
 @app.post("/gap-analysis", status_code=201)
-async def run_gap_analysis(payload: GapAnalysisRequest) -> Dict[str, Any]:
+async def run_gap_analysis(request: Request, payload: GapAnalysisRequest) -> Dict[str, Any]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
         use_case = UseCase(
+        workspace_id=workspace_id,
         title=payload.title,
         description=payload.description,
         business_goal=payload.business_goal,
@@ -605,16 +767,16 @@ async def run_gap_analysis(payload: GapAnalysisRequest) -> Dict[str, Any]:
         session.commit()
         session.refresh(use_case)
         use_case_id = use_case.id
-    return get_gap_report(use_case_id)
+    return get_gap_report(use_case_id, workspace_id=workspace_id)
 
 
 @app.get("/gaps/{use_case_id}")
-async def gap_report(use_case_id: int) -> Dict[str, Any]:
-    return get_gap_report(use_case_id)
+async def gap_report(request: Request, use_case_id: int) -> Dict[str, Any]:
+    return get_gap_report(use_case_id, workspace_id=_workspace_id(request))
 
 
 @app.post("/generate-connectors", status_code=201)
-async def generate_connectors(payload: ConnectorGenerationRequest) -> Dict[str, Any]:
+async def generate_connectors(request: Request, payload: ConnectorGenerationRequest) -> Dict[str, Any]:
     payload_dict = {
         "system_name": payload.system_name,
         "category": payload.category,
@@ -622,13 +784,18 @@ async def generate_connectors(payload: ConnectorGenerationRequest) -> Dict[str, 
         "use_case_title": payload.use_case_title,
         "language": payload.language,
     }
-    return generate_automation_package(payload_dict, language=payload.language)
+    return generate_automation_package(
+        payload_dict,
+        language=payload.language,
+        workspace_id=_workspace_id(request),
+    )
 
 
 @app.get("/artifacts")
-async def list_artifacts() -> List[Dict[str, Any]]:
+async def list_artifacts(request: Request) -> List[Dict[str, Any]]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        artifacts = session.exec(select(GeneratedArtifact)).all()
+        artifacts = session.exec(_workspace_select(GeneratedArtifact, workspace_id)).all()
         return [
             {
                 "id": artifact.id,
@@ -644,11 +811,17 @@ async def list_artifacts() -> List[Dict[str, Any]]:
 
 
 @app.post("/validate", status_code=201)
-async def validate(payload: ValidationRequest) -> Dict[str, Any]:
+async def validate(request: Request, payload: ValidationRequest) -> Dict[str, Any]:
+    workspace_id = _workspace_id(request)
     artifact_payload: Optional[Dict[str, Any]] = None
     with Session(engine) as session:
         if payload.artifact_id:
-            artifact = session.get(GeneratedArtifact, payload.artifact_id)
+            artifact = session.exec(
+                select(GeneratedArtifact).where(
+                    GeneratedArtifact.id == payload.artifact_id,
+                    GeneratedArtifact.workspace_id == workspace_id,
+                )
+            ).first()
             if not artifact:
                 raise HTTPException(status_code=404, detail="Artifact not found")
             artifact_payload = artifact.artifact_json["connector"]
@@ -665,6 +838,7 @@ async def validate(payload: ValidationRequest) -> Dict[str, Any]:
         result = validate_code_in_sandbox(artifact_payload)
         session.add(
             ValidationRun(
+                workspace_id=workspace_id,
                 artifact_id=payload.artifact_id,
                 filename=artifact_payload["filename"],
                 language=artifact_payload.get("language", payload.language),
@@ -677,16 +851,23 @@ async def validate(payload: ValidationRequest) -> Dict[str, Any]:
 
 
 @app.get("/validations")
-async def list_validations() -> List[Dict[str, Any]]:
+async def list_validations(request: Request) -> List[Dict[str, Any]]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        validations = session.exec(select(ValidationRun)).all()
+        validations = session.exec(_workspace_select(ValidationRun, workspace_id)).all()
         return [row.result_json for row in validations]
 
 
 @app.get("/reports")
-async def reports() -> Dict[str, Any]:
+async def reports(request: Request) -> Dict[str, Any]:
+    workspace_id = _workspace_id(request)
     with Session(engine) as session:
-        validations = [row.result_json for row in session.exec(select(ValidationRun)).all()]
+        documents = session.exec(_workspace_select(DocumentRecord, workspace_id)).all()
+        inventory_rows = session.exec(_workspace_select(InventorySystem, workspace_id).order_by(InventorySystem.id.desc())).all()
+        use_cases = session.exec(_workspace_select(UseCase, workspace_id)).all()
+        validations = [row.result_json for row in session.exec(_workspace_select(ValidationRun, workspace_id)).all()]
+        artifact_rows = session.exec(_workspace_select(GeneratedArtifact, workspace_id)).all()
+
         artifacts = [
             {
                 "id": artifact.id,
@@ -695,23 +876,60 @@ async def reports() -> Dict[str, Any]:
                 "filename": artifact.filename,
                 "created_at": artifact.created_at.isoformat(),
             }
-            for artifact in session.exec(select(GeneratedArtifact)).all()
+            for artifact in artifact_rows
         ]
+        document_payloads = [
+            {
+                "id": document.id,
+                "filename": document.filename,
+                "content_type": document.content_type,
+                "size_bytes": document.size_bytes,
+                "retained": document.retained,
+                "created_at": document.created_at.isoformat(),
+            }
+            for document in documents
+        ]
+        inventory_items = [_inventory_payload(row) for row in inventory_rows]
+
     return {
-        "documents": await list_documents(),
-        "inventory": await list_inventory(),
-        "use_cases": await list_use_cases(),
+        "documents": document_payloads,
+        "inventory": {"items": inventory_items, "total": len(inventory_items), "page": 1, "page_size": len(inventory_items) or 10},
+        "use_cases": [_use_case_payload(row) for row in use_cases],
         "artifacts": artifacts,
         "validations": validations,
     }
 
 
 @app.get("/reports/gaps/{use_case_id}.json")
-async def export_gap_report(use_case_id: int) -> FileResponse:
-    report = get_gap_report(use_case_id)
-    output_path = settings.reports_dir / f"gap_report_{use_case_id}.json"
-    output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    return FileResponse(output_path, media_type="application/json", filename=output_path.name)
+async def export_gap_report(request: Request, use_case_id: int) -> Response:
+    report = get_gap_report(use_case_id, workspace_id=_workspace_id(request))
+    filename = f"gap_report_{use_case_id}.json"
+    return Response(
+        content=json.dumps(report, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/", include_in_schema=False)
+async def application_root():
+    index_path = FRONTEND_DIST / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    return JSONResponse({"name": settings.app_name, "status": "api-only", "health": "/health"})
+
+
+@app.get("/assets/{asset_path:path}", include_in_schema=False)
+async def frontend_assets(asset_path: str):
+    assets_root = (FRONTEND_DIST / "assets").resolve()
+    candidate = (assets_root / asset_path).resolve()
+    try:
+        candidate.relative_to(assets_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Asset not found") from exc
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return FileResponse(candidate)
 
 
 @app.get("/demo/workflow")

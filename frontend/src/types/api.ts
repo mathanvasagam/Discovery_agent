@@ -33,6 +33,50 @@ export interface DashboardSummary {
   average_confidence: number
 }
 
+export interface LlmStatus {
+  provider: string
+  configured: boolean
+  connected?: boolean
+  model: string | null
+  message?: string
+  failover_order?: string[]
+  attempted_providers?: string[]
+  providers?: Record<string, { configured: boolean; model: string | null }>
+}
+
+export interface RuntimeStatus {
+  environment: string
+  validation_mode: string
+  workspace_isolation: boolean
+  rate_limits: boolean
+  original_upload_retention: boolean
+  database: string
+  privacy_mode: string
+}
+
+export interface HealthStatus {
+  status: string
+  llm: LlmStatus
+  runtime?: RuntimeStatus
+}
+
+export interface UseCaseCreateRequest {
+  title: string
+  description: string
+  business_goal: string
+  target_systems: string[]
+  frequency: string
+  criticality: string
+}
+
+export interface ConnectorGenerationRequest {
+  system_name: string
+  category: string
+  auth_method: string
+  use_case_title: string
+  language: string
+}
+
 export interface UseCaseSummary {
   id: number
   title: string

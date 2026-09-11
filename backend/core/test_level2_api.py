@@ -44,6 +44,25 @@ def test_create_use_case_returns_created_payload(client):
     assert payload["target_systems"] == ["Salesforce", "NetSuite"]
 
 
+def test_health_reports_safe_llm_configuration(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "healthy"
+    assert "llm" in payload
+    assert "configured" in payload["llm"]
+    assert "api_key" not in payload["llm"]
+
+
+def test_cors_allows_local_vite_loopback_origin(client):
+    response = client.get(
+        "/health",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == "http://127.0.0.1:5173"
+
+
 def test_discover_goals_endpoint_fallback(client):
     # Test discovery when no documents or inventory exist (should return default use cases)
     response = client.post("/use-cases/discover")

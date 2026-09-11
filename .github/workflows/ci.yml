@@ -53,4 +53,4 @@ jobs:
       - name: Build frontend image
         run: docker build -t discovery-agent-frontend:ci ./frontend
       - name: Validate Compose configuration
-        run: docker compose config
+        run: docker compose config --quiet

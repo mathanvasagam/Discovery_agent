@@ -3,8 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Column
-from sqlalchemy.dialects.sqlite import JSON
+from sqlalchemy import JSON, Column, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -14,6 +13,7 @@ def utcnow() -> datetime:
 
 class UseCase(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    workspace_id: str = Field(default="default", index=True)
     title: str
     description: str
     business_goal: str = ""
@@ -29,15 +29,19 @@ class UseCase(SQLModel, table=True):
 
 class DocumentRecord(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    workspace_id: str = Field(default="default", index=True)
     filename: str
     stored_path: str
     content_type: str
     size_bytes: int = 0
+    extracted_text: str = Field(default="", sa_column=Column(Text))
+    retained: bool = True
     created_at: datetime = Field(default_factory=utcnow, nullable=False)
 
 
 class InventorySystem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    workspace_id: str = Field(default="default", index=True)
     name: str = Field(index=True)
     category: str
     auth_method: str
@@ -45,11 +49,11 @@ class InventorySystem(SQLModel, table=True):
     business_processes: List[str] = Field(default_factory=list, sa_column=Column(JSON))
     criticality: str
     confidence_score: float
-    evidence: str  # Primary evidence
+    evidence: str
     all_evidence: List[str] = Field(default_factory=list, sa_column=Column(JSON))
     inference_note: str = ""
     human_review_required: bool = False
-    source_reference: str  # Primary source
+    source_reference: str
     all_sources: List[str] = Field(default_factory=list, sa_column=Column(JSON))
     page_number: Optional[int] = None
     line_number: Optional[int] = None
@@ -58,6 +62,7 @@ class InventorySystem(SQLModel, table=True):
 
 class GapReportRecord(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    workspace_id: str = Field(default="default", index=True)
     use_case_id: int = Field(foreign_key="usecase.id")
     report_json: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utcnow, nullable=False)
@@ -65,6 +70,7 @@ class GapReportRecord(SQLModel, table=True):
 
 class GeneratedArtifact(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    workspace_id: str = Field(default="default", index=True)
     system_name: str
     language: str
     filename: str
@@ -75,6 +81,7 @@ class GeneratedArtifact(SQLModel, table=True):
 
 class ValidationRun(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    workspace_id: str = Field(default="default", index=True)
     artifact_id: Optional[int] = Field(default=None, foreign_key="generatedartifact.id")
     filename: str
     language: str

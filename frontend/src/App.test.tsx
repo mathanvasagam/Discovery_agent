@@ -9,6 +9,8 @@ const mockDashboard = {
   use_cases: 1,
   artifacts: 1,
   validations: 1,
+  integration_gaps: 1,
+  average_confidence: 96.5,
   latest_systems: [
     {
       name: 'Salesforce',
@@ -73,12 +75,13 @@ const mockGapReport = {
   use_case_title: 'Invoice Automation',
   business_goal: 'Automatically create invoices from Salesforce opportunities.',
   required_systems: ['Salesforce', 'NetSuite', 'Stripe'],
+  strategic_recommendation: 'Generate the missing Stripe connector before automating the full invoice flow.',
   available_systems: ['Salesforce', 'NetSuite'],
   missing_systems: ['Stripe'],
   integration_gaps: [],
   gaps: [
-    { system_name: 'Salesforce', status: 'available', priority: 'Medium', details: 'Discovered with 98.0% confidence.' },
-    { system_name: 'Stripe', status: 'missing', priority: 'High', details: 'No evidence found in the current inventory.' },
+    { system_name: 'Salesforce', status: 'available', priority: 'Medium', effort_estimate: 'Low', details: 'Discovered with 98.0% confidence.' },
+    { system_name: 'Stripe', status: 'missing', priority: 'High', effort_estimate: 'Medium', details: 'No evidence found in the current inventory.' },
   ],
   data_flow_analysis: [],
   dependency_mapping: ['Integration with Stripe must exist before Invoice Automation can be automated.'],
@@ -95,10 +98,18 @@ const mockReports = {
   validations: [{ status: 'pass', output: 'Validation passed.', warnings: [], errors: [], logs: [], filename: 'stripe_connector.py' }],
 }
 
+const mockHealth = {
+  status: 'healthy',
+  llm: { provider: 'groq', configured: true, model: 'openai/gpt-oss-120b' },
+}
+
 describe('App', () => {
   beforeEach(() => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
+      if (url.includes('/health')) {
+        return Promise.resolve(new Response(JSON.stringify(mockHealth), { status: 200 }))
+      }
       if (url.includes('/dashboard')) {
         return Promise.resolve(new Response(JSON.stringify(mockDashboard), { status: 200 }))
       }
@@ -153,10 +164,11 @@ describe('App', () => {
     vi.restoreAllMocks()
   })
 
-  it('renders the dashboard title', async () => {
+  it('renders the enterprise dashboard without the old demo hero', async () => {
     render(<App />)
-    expect(await screen.findByRole('heading', { name: /Discovery Agent Demo Console/i })).toBeInTheDocument()
     expect(await screen.findByRole('heading', { name: /Dashboard/i })).toBeInTheDocument()
+    expect(await screen.findByText(/Enterprise system discovery, integration gaps, and generated artifacts/i)).toBeInTheDocument()
+    expect(screen.queryByText(/Discovery Agent Demo Console/i)).not.toBeInTheDocument()
   })
 
   it('renders inventory results and filters by search', async () => {
@@ -178,7 +190,15 @@ describe('App', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Gap Analysis/i }))
     expect(await screen.findByText(/Invoice Automation/i)).toBeInTheDocument()
     expect((await screen.findAllByText(/^Stripe$/i))[0]).toBeInTheDocument()
-    expect(await screen.findByText(/^MISSING$/i)).toBeInTheDocument()
+    expect((await screen.findAllByText(/^MISSING$/i)).length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('does not fabricate report timestamps', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /Reports/i }))
+    expect(await screen.findByRole('heading', { name: /Reports/i })).toBeInTheDocument()
+    expect(await screen.findByText(/stripe_connector.py/i)).toBeInTheDocument()
+    expect(screen.queryByText(/Just now/i)).not.toBeInTheDocument()
   })
 
   it('renders generated connector details', async () => {

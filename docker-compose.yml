@@ -9,6 +9,7 @@ services:
       DISCOVERY_CORS_ORIGINS: http://localhost:8080
       DISCOVERY_MAX_UPLOAD_BYTES: 20971520
       DISCOVERY_GROQ_API_KEY: ${DISCOVERY_GROQ_API_KEY:-}
+      DISCOVERY_GROQ_MODEL: ${DISCOVERY_GROQ_MODEL:-openai/gpt-oss-120b}
     volumes:
       - ./backend/data:/app/backend/data
     restart: unless-stopped

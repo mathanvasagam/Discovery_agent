@@ -5,7 +5,7 @@ from collections import Counter
 from typing import Any, Dict, List
 
 from core.discovery_catalog import GOAL_KEYWORDS, iter_profiles
-from core.llm import call_gemini
+from core.provider_router import call_llm
 
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ def call_llm_mapping(use_case: Dict[str, Any], inventory: List[Dict[str, Any]]) 
       ]
     - "strategic_recommendation": "A short summary of the integration roadmap."
     """
-    result = call_gemini(prompt)
+    result = call_llm(prompt)
     return result if isinstance(result, dict) else {}
 
 

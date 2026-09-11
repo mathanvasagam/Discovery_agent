@@ -6,7 +6,7 @@ from textwrap import dedent
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
-from core.llm import call_gemini
+from core.llm import call_llm as call_provider_llm
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ def call_llm(prompt: str) -> Dict[str, Any]:
     """
     Hook for model-driven code generation.
     """
-    result = call_gemini(prompt)
+    result = call_provider_llm(prompt)
     return result if isinstance(result, dict) else {}
 
 
@@ -35,7 +35,7 @@ def call_llm_yaml(prompt: str) -> Dict[str, Any]:
     """
     Hook for model-driven agent definition generation.
     """
-    result = call_gemini(prompt)
+    result = call_provider_llm(prompt)
     return result if isinstance(result, dict) else {}
 
 

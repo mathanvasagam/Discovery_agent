@@ -196,6 +196,52 @@ def _run_local_validation(code_artifact: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _run_static_validation(code_artifact: Dict[str, Any]) -> Dict[str, Any]:
+    """Syntax-only validation for public hosted deployments; generated code is never executed."""
+    language = code_artifact.get("language", "python").lower()
+    filename = code_artifact.get("filename", "artifact.py")
+    warnings = _static_warnings(code_artifact.get("code", ""))
+    warnings.append("Hosted static validation does not execute generated code.")
+    logs: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="discovery-agent-static-") as temp_dir:
+        workspace = Path(temp_dir)
+        paths = _write_artifact(workspace, code_artifact)
+
+        if language == "python":
+            python_executable = sys.executable or "python"
+            commands = [[python_executable, "-m", "py_compile", paths["code"].name]]
+            if code_artifact.get("tests", "").strip():
+                commands.append([python_executable, "-m", "py_compile", paths["tests"].name])
+        elif language == "nodejs":
+            commands = [["node", "--check", paths["code"].name]]
+            if code_artifact.get("tests", "").strip():
+                commands.append(["node", "--check", paths["tests"].name])
+        else:
+            commands = []
+            errors.append(f"Unsupported sandbox language: {language}")
+
+        for command in commands:
+            result = _run_command(command, workspace, timeout_seconds=10)
+            logs.append(result)
+            if result["returncode"] != 0:
+                errors.append(result["stderr"].strip() or result["stdout"].strip() or "Static validation failed.")
+
+    status = "pass" if not errors else "fail"
+    return {
+        "status": status,
+        "output": "Static validation passed; runtime execution was intentionally skipped." if status == "pass" else "Static validation failed.",
+        "warnings": warnings,
+        "errors": errors,
+        "logs": logs,
+        "network_disabled": True,
+        "execution_performed": False,
+        "isolation": "static-only",
+        "filename": filename,
+    }
+
+
 def run_in_docker(code_artifact: Dict[str, Any], network_disabled: bool = True) -> Dict[str, Any]:
     """Execute generated code inside a constrained, network-disabled Docker container."""
     language = code_artifact.get("language", "python").lower()
@@ -281,7 +327,9 @@ def validate_code_in_sandbox(code_artifact: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "fail", "output": msg, "warnings": [], "errors": [msg], "logs": []}
 
     validation_mode = os.getenv("DISCOVERY_VALIDATION_MODE", "docker").strip().lower()
-    if validation_mode == "local":
+    if validation_mode == "static":
+        result = _run_static_validation(code_artifact)
+    elif validation_mode == "local":
         result = _run_local_validation(code_artifact)
         result.setdefault("warnings", []).append(
             "Development-only local validation is enabled; generated code executes on the host."
@@ -289,7 +337,7 @@ def validate_code_in_sandbox(code_artifact: Dict[str, Any]) -> Dict[str, Any]:
     elif validation_mode == "docker":
         result = run_in_docker(code_artifact, network_disabled=True)
     else:
-        msg = f"Unsupported validation mode: {validation_mode}. Use 'docker' or 'local'."
+        msg = f"Unsupported validation mode: {validation_mode}. Use 'static', 'docker', or 'local'."
         return {"status": "fail", "output": msg, "warnings": [], "errors": [msg], "logs": []}
 
     logger.info("Validation result for %s: %s", code_artifact.get("filename"), result["status"])

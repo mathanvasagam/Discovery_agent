@@ -1,14 +1,18 @@
 import type {
+  ConnectorGenerationRequest,
   DashboardSummary,
   GapReport,
   GeneratedPackage,
+  HealthStatus,
   InventoryResponse,
   ReportsPayload,
+  UseCaseCreateRequest,
   UseCaseSummary,
   ValidationResult,
 } from '../types/api'
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const configuredApiUrl = String(import.meta.env.VITE_API_URL ?? '').trim().replace(/\/$/, '')
+const API_BASE_URL = configuredApiUrl || (import.meta.env.PROD ? '' : 'http://localhost:8000')
 
 type InventoryQuery = {
   search?: string
@@ -29,6 +33,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   baseUrl: API_BASE_URL,
+
+  getHealth() {
+    return request<HealthStatus>('/health')
+  },
+
+  verifyLlm() {
+    return request<HealthStatus['llm']>('/integrations/llm/verify', { method: 'POST' })
+  },
 
   getDashboard() {
     return request<DashboardSummary>('/dashboard')
@@ -58,7 +70,9 @@ export const api = {
   },
 
   clearInventory() {
-    return fetch(`${API_BASE_URL}/inventory`, { method: 'DELETE' })
+    return fetch(`${API_BASE_URL}/inventory`, { method: 'DELETE' }).then((response) => {
+      if (!response.ok) throw new Error(`Unable to clear inventory (${response.status}).`)
+    })
   },
 
   getUseCases() {
@@ -71,7 +85,7 @@ export const api = {
     })
   },
 
-  createUseCase(payload: Record<string, unknown>) {
+  createUseCase(payload: UseCaseCreateRequest) {
     return request<UseCaseSummary>('/use-cases', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -91,7 +105,7 @@ export const api = {
     })
   },
 
-  generateConnector(payload: Record<string, unknown>) {
+  generateConnector(payload: ConnectorGenerationRequest) {
     return request<GeneratedPackage>('/generate-connectors', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

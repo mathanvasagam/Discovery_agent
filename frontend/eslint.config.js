@@ -18,11 +18,5 @@ export default defineConfig([
     languageOptions: {
       globals: globals.browser,
     },
-<<<<<<< HEAD
-=======
-    rules: {
-      'react-hooks/set-state-in-effect': 'off',
-    },
->>>>>>> 6f4fdb8 (Change in UI and UX design)
   },
 ])

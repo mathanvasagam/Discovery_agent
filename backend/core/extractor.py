@@ -5,7 +5,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from core.discovery_catalog import PROFILE_BY_ALIAS, iter_profiles
-from core.llm import call_gemini
+from core.provider_router import call_llm as call_provider_llm
 
 
 logger = logging.getLogger(__name__)
@@ -21,10 +21,8 @@ GENERIC_SYSTEM_PATTERNS = [
 
 
 def call_llm(prompt: str) -> Any:
-    """
-    Hook for Gemini-backed extraction.
-    """
-    return call_gemini(prompt)
+    """Hook for provider-backed extraction."""
+    return call_provider_llm(prompt)
 
 
 def _sentence_candidates(text: str) -> List[str]:

@@ -26,7 +26,11 @@ Instead of manually reading architecture documents, spreadsheets, PDFs, and oper
 
 The system is intentionally **hybrid**: deterministic extraction and mapping provide predictable fallback behavior, while an optional LLM provider can enrich discovery, mapping, and generation when configured.
 
-> **Current maturity:** production-oriented, test-backed prototype. The core workflow is implemented and containerized; authentication/authorization, database migrations, production observability, and a dedicated remote sandbox service remain recommended before public or multi-user deployment.
+> **Current maturity:** production-oriented, test-backed prototype with a hardened public-demo mode. The core workflow is implemented and containerized; the demo supports signed anonymous workspace isolation, rate limits, PostgreSQL deployment, and static-only hosted connector validation. Authenticated identity/RBAC, managed migrations, production observability, and a dedicated remote sandbox service remain recommended for a real multi-user production deployment.
+
+> **New to the codebase?** Read the [Technical Guide](docs/TECHNICAL_GUIDE.md) for a file-by-file architecture walkthrough, keyword glossary, sandbox security explanation, troubleshooting, and interview/project-review questions.
+>
+> **Deploying the portfolio demo?** Use the [Supabase + Render deployment runbook](docs/DEPLOYMENT.md). It keeps secrets out of Git, uses managed PostgreSQL persistence, isolates anonymous visitor workspaces, deletes original uploads after redacted extraction, and disables runtime execution of generated code on the public host.
 
 ---
 
@@ -35,7 +39,7 @@ The system is intentionally **hybrid**: deterministic extraction and mapping pro
 ```mermaid
 flowchart LR
     A[Enterprise Documents] --> B[Ingestion Layer]
-    B --> C[PII Redaction]
+    B --> C[Limited Pattern Redaction]
     C --> D[System Discovery]
     D --> E[(System Inventory)]
     E --> F[Use Case Discovery]
@@ -115,12 +119,12 @@ sequenceDiagram
 | Layer | Technology |
 | --- | --- |
 | API | FastAPI |
-| Data models / persistence | SQLModel + SQLite |
+| Data models / persistence | SQLModel + SQLite (local development) / PostgreSQL (deployed demo) |
 | Validation / settings | Pydantic Settings |
 | Document processing | pdfplumber, openpyxl, Pillow, pytesseract |
-| Optional LLM provider | Groq — `llama-3.3-70b-versatile` |
+| Optional LLM providers | Provider router with Gemini + Groq failover and deterministic fallback |
 | Frontend | React 19, TypeScript, Vite |
-| Styling | Tailwind/PostCSS pipeline |
+| Styling | Custom responsive CSS design system |
 | Frontend tests | Vitest + Testing Library |
 | Backend tests | Pytest |
 | Containerization | Docker + Docker Compose |
@@ -173,51 +177,16 @@ Runtime uploads, generated connector artifacts, reports, local databases, fronte
 
 ## Quick Start
 
-### Option A — Docker Compose
-
-This is the simplest way to run the application stack.
+### Recommended — one-command local development
 
 **Prerequisites**
 
-- Docker Engine / Docker Desktop
-- Docker Compose
+- Python 3.12 recommended
+- Node.js 22+
+- npm for first-time frontend dependency installation
+- Docker Engine / Docker Desktop when you want secure generated-code validation
 
-Build the Python sandbox image used for secure connector validation:
-
-```bash
-docker build \
-  -t discovery-agent-python-sandbox:3.12 \
-  -f backend/sandbox/python/Dockerfile .
-```
-
-Start the application:
-
-```bash
-docker compose up --build
-```
-
-Services:
-
-| Service | URL |
-| --- | --- |
-| Web application | `http://localhost:8080` |
-| FastAPI API | `http://localhost:8000` |
-| Health endpoint | `http://localhost:8000/health` |
-| OpenAPI docs | `http://localhost:8000/docs` |
-
-Stop the stack:
-
-```bash
-docker compose down
-```
-
----
-
-### Option B — Local Development
-
-#### Backend
-
-Python 3.12 is recommended.
+For a fresh clone, install dependencies once:
 
 ```bash
 python -m venv .venv
@@ -233,33 +202,88 @@ Activate the environment:
 source .venv/bin/activate
 ```
 
-Install dependencies and run the API:
+Install backend and frontend dependencies:
 
 ```bash
-pip install -r requirements.txt
-cd backend
-python -m uvicorn main:app --reload
+python -m pip install -r requirements.txt
+cd frontend
+npm ci
+cd ..
 ```
 
-API: `http://localhost:8000`
+Check the machine without starting long-running services:
 
-#### Frontend
+```bash
+python scripts/dev.py --check
+```
 
-Node.js 22+ is recommended.
+Start the backend and frontend together:
+
+```bash
+python scripts/dev.py
+```
+
+Local services:
+
+| Service | URL |
+| --- | --- |
+| Development UI | `http://127.0.0.1:5173` |
+| FastAPI API | `http://127.0.0.1:8000` |
+| Health endpoint | `http://127.0.0.1:8000/health` |
+| OpenAPI docs | `http://127.0.0.1:8000/docs` |
+
+Press `Ctrl+C` once to stop both development processes.
+
+For Docker-isolated Python connector validation, build the sandbox image once while Docker is running:
+
+```bash
+docker build -t discovery-agent-python-sandbox:3.12 -f backend/sandbox/python/Dockerfile .
+```
+
+### Manual local startup
+
+<details>
+<summary>Run backend and frontend separately</summary>
+
+Backend from the repository root:
+
+```bash
+python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Frontend:
 
 ```bash
 cd frontend
-npm ci
 npm run dev
 ```
 
-Development UI: `http://localhost:5173`
+</details>
+
+### Docker Compose application stack
+
+```bash
+docker compose up --build
+```
+
+| Service | URL |
+| --- | --- |
+| Web application | `http://localhost:8080` |
+| FastAPI API | `http://localhost:8000` |
+
+Stop the stack with:
+
+```bash
+docker compose down
+```
+
+> **Sandbox boundary:** the current backend container is intentionally not given access to the host Docker daemon. As a result, fully containerized connector validation requires a dedicated sandbox worker/service in a future production architecture. Do not solve this by casually mounting the Docker socket into the main API container.
 
 ---
 
 ## Configuration
 
-The backend uses the `DISCOVERY_` environment prefix. A local `backend/.env` file can be used for development, but credentials must never be committed.
+The backend uses the `DISCOVERY_` environment prefix. Use the project-root `.env` file for local development (it is also the file Docker Compose reads); credentials must never be committed.
 
 ### Application configuration
 
@@ -267,6 +291,7 @@ The backend uses the `DISCOVERY_` environment prefix. A local `backend/.env` fil
 | --- | --- | --- |
 | `DISCOVERY_DATABASE_URL` | Local SQLite database | SQLModel database connection |
 | `DISCOVERY_GROQ_API_KEY` | unset | Enables optional Groq-assisted workflows |
+| `DISCOVERY_GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model used for JSON extraction and generation |
 | `DISCOVERY_DEMO_MODE` | `false` | Controls application demo behavior |
 | `DISCOVERY_CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed browser origins |
 | `DISCOVERY_MAX_UPLOAD_BYTES` | `20971520` | Maximum upload size in bytes — 20 MiB by default |
@@ -360,38 +385,43 @@ The upload path includes:
 
 ### Current security boundary
 
-Authentication and authorization are **not yet implemented**. The current deployment should therefore be treated as a trusted/local or controlled-environment application until identity, access control, rate limiting, and production ingress controls are added.
+The public-demo profile implements signed anonymous workspace isolation, per-workspace rate limits, trusted-host checks, production security headers, PostgreSQL-backed persistence, and static-only hosted connector validation. It is suitable for a portfolio/demo deployment where visitors need isolated temporary workspaces without creating accounts.
 
-> `DISCOVERY_VALIDATION_MODE=local` executes generated code on the host and is intended only for trusted local development.
+It is **not a substitute for authenticated identity and authorization**. A real multi-user SaaS or enterprise deployment should add user/organization authentication, RBAC, database-level tenant controls where appropriate, distributed rate limiting, centralized audit logging, and managed migrations.
+
+> `DISCOVERY_VALIDATION_MODE=local` executes generated code on the host and is intended only for trusted local development. Public production mode intentionally requires `DISCOVERY_VALIDATION_MODE=static`.
 
 ---
 
 ## Testing & Quality Gates
 
-The current audited project state passes the following checks:
+Run the repository quality gates from the root with one command:
+
+```bash
+python scripts/verify.py
+```
+
+The current verified local state passes:
 
 | Quality gate | Verified result |
 | --- | --- |
-| Backend Pytest suite | **14 / 14 passed** |
+| Backend Pytest suite | **15 / 15 passed** |
 | Backend compile check | **Passed** |
 | Frontend ESLint | **0 errors, 0 warnings** |
-| Frontend Vitest suite | **4 / 4 passed** |
-| TypeScript / Vite production build | **Passed** |
-| Real `POST /use-cases` smoke test | **Passed — HTTP 201** |
-| Generated Python connector validation | **Passed in explicit trusted-local mode** |
-| Docker-unavailable secure failure path | **Passed** |
-| Docker Compose configuration | **Validated** |
-| GitHub Actions YAML | **Validated** |
+| Frontend Vitest suite | **5 / 5 passed** |
+| Frontend TypeScript build | **Passed** |
+| Frontend Vite production build | **Passed** |
+| Docker Compose configuration | **Passed in quiet validation mode** |
 
-### Run backend checks
+The verifier intentionally validates Compose with `config --quiet` so environment-variable expansion does not print local secrets into logs.
+
+Individual checks remain available when diagnosing a failure:
 
 ```bash
 cd backend
 python -m pytest core -q
 python -m compileall -q .
 ```
-
-### Run frontend checks
 
 ```bash
 cd frontend
@@ -477,29 +507,28 @@ The repository contains production-oriented container definitions:
 - Compose: backend/frontend orchestration and persistent backend data mount
 - sandbox: dedicated Python validation image
 
-For an internet-facing deployment, add at minimum:
+For the free public demo, the repository now includes a single-service Render Blueprint and a Supabase PostgreSQL path. The hosted profile uses same-origin React + FastAPI serving, generated signing secrets, anonymous workspace isolation, request quotas, non-retained original uploads, and static-only generated-code validation. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
-- authentication and role-based authorization
-- TLS termination / trusted reverse proxy
-- secret manager integration
-- managed production database
-- database migrations
-- rate limiting and request quotas
-- structured logs and distributed tracing
-- metrics, alerting and health monitoring
-- object storage or managed document storage
-- dedicated sandbox worker/service isolated from the API host
+For a true production deployment beyond the demo, add at minimum:
+
+- authenticated users, organizations, and role-based authorization
+- database migration management (for example Alembic)
+- distributed rate limiting and abuse protection
+- structured logs, tracing, metrics, alerting and audit retention
+- managed object storage when original document retention is required
+- a dedicated sandbox worker/service isolated from the API host for runtime execution
+- enterprise secrets management and formal data-retention policies
 
 ---
 
 ## Current Limitations
 
-- No authentication or authorization layer yet.
-- SQLite is appropriate for the current scope but should be replaced with a managed database for multi-instance production deployment.
+- Public demo isolation is anonymous-cookie based rather than authenticated user/organization authorization.
+- SQLite remains the local-development default; the public deployment path uses managed PostgreSQL.
 - Schema migrations are not yet managed through Alembic or an equivalent migration framework.
 - Generated fallback connectors are generic scaffolds, not guaranteed vendor-certified implementations.
 - Confidence scores are heuristic rather than calibrated against a labelled benchmark dataset.
-- Raw uploaded documents are stored locally; highly sensitive deployments should use encrypted managed storage and explicit retention policies.
+- Local development can retain raw uploads; the public demo profile deletes originals after redacted extraction. Production deployments that require original retention should use encrypted managed storage and explicit retention policies.
 - Full Docker sandbox execution requires a running Docker engine and the configured sandbox image.
 
 ---
@@ -508,12 +537,13 @@ For an internet-facing deployment, add at minimum:
 
 - [ ] Authentication and role-based access control
 - [ ] Alembic database migrations
-- [ ] PostgreSQL production persistence option
-- [ ] Structured JSON logging and request correlation IDs
+- [x] PostgreSQL deployment persistence option
+- [ ] Structured JSON logging and persistent request audit trail
 - [ ] Metrics / tracing / operational dashboards
-- [ ] Rate limiting and upload quotas
+- [x] Public-demo rate limiting and upload quotas
+- [ ] Distributed rate-limit backend for multi-instance deployment
 - [ ] Dedicated sandbox worker service
-- [ ] Provider-neutral LLM abstraction
+- [x] Provider-neutral Gemini/Groq failover router
 - [ ] Calibrated extraction evaluation dataset
 - [ ] Vendor-specific connector adapters and contract tests
 - [ ] End-to-end browser/API integration tests
@@ -528,21 +558,17 @@ Recommended workflow for changes:
 # 1. Create a branch
 git checkout -b feature/<name>
 
-# 2. Run backend checks
-cd backend
-python -m pytest core -q
-python -m compileall -q .
+# 2. Confirm the machine is ready
+python scripts/dev.py --check
 
-# 3. Run frontend checks
-cd ../frontend
-npm run lint
-npm test
-npm run build
+# 3. Run the application while developing
+python scripts/dev.py
 
-# 4. Validate containers from the repository root
-cd ..
-docker compose config
+# 4. Before committing, run every required quality gate
+python scripts/verify.py
 ```
+
+For architecture and terminology, use [docs/TECHNICAL_GUIDE.md](docs/TECHNICAL_GUIDE.md). For the current enterprise UX/dev-ex contract, see `docs/superpowers/specs/2026-09-06-enterprise-ux-devex-design.md`.
 
 Pull requests should keep application behavior, tests, documentation, and deployment configuration consistent.
 
