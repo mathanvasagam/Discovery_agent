@@ -54,6 +54,18 @@ def test_health_reports_safe_llm_configuration(client):
     assert "api_key" not in payload["llm"]
 
 
+def test_liveness_is_database_independent(client):
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "alive"}
+
+
+def test_readiness_reports_database_ready(client):
+    response = client.get("/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
 def test_cors_allows_local_vite_loopback_origin(client):
     response = client.get(
         "/health",

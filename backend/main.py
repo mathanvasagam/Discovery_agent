@@ -55,17 +55,27 @@ elif database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
 connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+engine_kwargs: Dict[str, Any] = {
+    "echo": False,
+    "connect_args": connect_args,
+    "pool_pre_ping": True,
+}
 if database_url.startswith("postgresql+psycopg://"):
     # Supabase's transaction pooler does not support client-side prepared statements.
+    # Keep connection attempts bounded so a bad/unreachable pooler cannot hang app startup.
     connect_args["prepare_threshold"] = None
-engine = create_engine(database_url, echo=False, connect_args=connect_args, pool_pre_ping=True)
+    connect_args["connect_timeout"] = 8
+    engine_kwargs["pool_timeout"] = 10
+    engine_kwargs["pool_recycle"] = 300
+
+engine = create_engine(database_url, **engine_kwargs)
 FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+_database_initialized = False
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    create_db_and_tables()
-    ensure_compatibility_columns()
+    _initialize_database()
     yield
 
 
@@ -121,6 +131,31 @@ def ensure_compatibility_columns() -> None:
                     connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
             if "workspace_id" in additions:
                 connection.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table_name}_workspace_id ON {table_name} (workspace_id)"))
+
+
+def _initialize_database() -> bool:
+    """Best-effort schema initialization.
+
+    The web process must remain alive when the managed database is temporarily
+    unavailable. Readiness stays false until the database can be reached and
+    initialization succeeds.
+    """
+    global _database_initialized
+    try:
+        create_db_and_tables()
+        ensure_compatibility_columns()
+        _database_initialized = True
+        logger.info("Database initialization completed.")
+        return True
+    except Exception as exc:
+        _database_initialized = False
+        logger.error("Database initialization unavailable: %s", exc)
+        return False
+
+
+def _database_ping() -> None:
+    with Session(engine) as session:
+        session.exec(text("SELECT 1"))
 
 
 def _workspace_id(request: Request) -> str:
@@ -355,21 +390,38 @@ def generate_automation_package(
     }
 
 
+@app.get("/healthz", include_in_schema=False)
+async def liveness() -> Dict[str, str]:
+    """Process-level liveness used by Render/Docker health checks."""
+    return {"status": "alive"}
+
+
 @app.get("/health")
 async def health() -> Dict[str, Any]:
+    database_status = "healthy"
     try:
-        with Session(engine) as session:
-            session.exec(text("SELECT 1"))
+        _database_ping()
     except Exception as exc:
+        database_status = "unavailable"
         logger.error("Database health check failed: %s", exc)
-        raise HTTPException(status_code=503, detail="Database unavailable") from exc
-    return {"status": "healthy", "llm": get_llm_status(), "runtime": settings.runtime_status()}
+
+    return {
+        "status": "healthy" if database_status == "healthy" else "degraded",
+        "database": database_status,
+        "llm": get_llm_status(),
+        "runtime": settings.runtime_status(),
+    }
 
 
 @app.get("/ready")
 async def readiness() -> Dict[str, Any]:
-    with Session(engine) as session:
-        session.exec(text("SELECT 1"))
+    try:
+        if not _database_initialized and not _initialize_database():
+            raise RuntimeError("Database initialization is incomplete.")
+        _database_ping()
+    except Exception as exc:
+        logger.error("Readiness check failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "ready"}
 
 

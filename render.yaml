@@ -6,7 +6,7 @@ services:
     region: singapore
     dockerfilePath: ./backend/Dockerfile
     dockerContext: .
-    healthCheckPath: /ready
+    healthCheckPath: /healthz
     autoDeployTrigger: checksPass
     envVars:
       - key: DISCOVERY_ENVIRONMENT
