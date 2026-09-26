@@ -1,7 +1,11 @@
 # Discovery Agent Enterprise UX and Developer Experience Design
 
 **Date:** 2026-09-06
-**Status:** Approved for implementation
+**Status:** Implemented - historical design record
+
+> **Current state (11 September 2026):** The UX/dev-ex scope in this document has been implemented. Subsequent deployment hardening extended the original scope: Discovery Agent is now live at `https://discovery-agent-demo.onrender.com/` using a single Render service, Supabase PostgreSQL, Gemini/Groq provider failover, signed anonymous workspace isolation, rate limits, non-retained original uploads, security headers, and static-only hosted connector validation. The original "Excluded" list below is preserved to document the scope decision that existed when this design was approved; public-cloud deployment was added later as a separate implementation phase.
+
+For the current architecture, use [`../../TECHNICAL_GUIDE.md`](../../TECHNICAL_GUIDE.md) and [`../../DEPLOYMENT.md`](../../DEPLOYMENT.md) as the source of truth.
 
 ## Objective
 

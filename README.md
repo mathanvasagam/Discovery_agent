@@ -265,7 +265,7 @@ See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** for the complete Render + Supab
 
 | Area | Endpoints |
 | --- | --- |
-| Health | `GET /health`, `GET /ready` |
+| Health | `GET /healthz` (liveness), `GET /health` (runtime state), `GET /ready` (database readiness) |
 | Documents | `POST /documents/upload`, `GET /documents` |
 | Inventory | `GET /inventory`, exports, clear inventory |
 | Use cases | create, list, auto-discover |
@@ -290,7 +290,7 @@ Current verified local state:
 
 | Check | Result |
 | --- | --- |
-| Backend Pytest | **16 / 16 passed** |
+| Backend Pytest | **18 / 18 passed** |
 | Backend compile check | **Passed** |
 | Frontend ESLint | **Passed** |
 | Frontend Vitest | **5 / 5 passed** |

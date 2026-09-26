@@ -1,19 +1,40 @@
-# Discovery Agent — Free Demo Deployment Runbook
+# Discovery Agent - Live Deployment & Operations Runbook
 
-This runbook deploys Discovery Agent as a public portfolio/demo application with a single Render web service and Supabase PostgreSQL.
+Discovery Agent is deployed as a public portfolio/demo application.
 
-## Target architecture
+**Live URL:** https://discovery-agent-demo.onrender.com/
+
+**Current deployment state:** Live
+
+| Layer | Deployed technology |
+|---|---|
+| Hosting | Render Free Web Service |
+| Runtime | Single Docker service |
+| Frontend | React 19 + TypeScript + Vite build, served by FastAPI |
+| Backend | FastAPI / Python 3.12 |
+| Persistence | Supabase PostgreSQL |
+| AI routing | Gemini -> Groq -> deterministic fallback |
+| Workspace boundary | Signed anonymous workspace cookie |
+| Upload retention | Original uploads deleted after processing |
+| Hosted code validation | Static syntax validation only |
+| Platform health check | `/healthz` (DB-independent liveness) |
+| CI/deploy policy | Render deploys after GitHub checks pass |
+
+---
+
+## 1. Deployed architecture
 
 ```text
 Browser
   |
   | HTTPS
   v
-Render Free Web Service
-  |- React production build (same origin)
+Render: discovery-agent-demo
   |- FastAPI API
+  |- React production assets (same origin)
   |- signed anonymous workspace cookie
-  |- per-workspace rate limits
+  |- per-workspace/client request quotas
+  |- security headers / trusted hosts
   |- static-only connector validation
   |
   +----> Supabase PostgreSQL
@@ -25,114 +46,30 @@ Render Free Web Service
   |                              |
   |                              +-- failure --> deterministic fallback
   |
-  +----> temporary upload processing
-          original deleted after redacted extraction
+  +----> temporary upload filesystem
+          original removed after redacted extraction
 ```
 
-The public demo intentionally does **not** retain original uploaded documents. Redacted extracted text, discovered systems, use cases, gap reports, generated artifact JSON, and validation results are persisted in PostgreSQL.
+The live service uses one origin for the React UI and FastAPI API. This reduces CORS complexity and allows the signed workspace cookie to remain first-party.
 
-## Why Supabase PostgreSQL instead of MongoDB
+---
 
-Discovery Agent already uses SQLModel/SQLAlchemy and relational records with foreign-key relationships. Supabase PostgreSQL therefore preserves the existing persistence architecture and requires only a database connection change. Moving to MongoDB would require replacing the ORM/session/query layer and does not provide a material benefit for this project.
-
-## About the Supabase MCP in VS Code
-
-The Supabase MCP is useful for inspecting the project, running SQL, and managing Supabase while developing. Discovery Agent does **not** depend on the MCP at runtime. The deployed application connects to Supabase through the PostgreSQL connection string stored only in Render's secret environment variables.
-
-This separation is intentional: developer tooling should not be a production runtime dependency.
-
-## 1. Prepare Supabase
-
-1. Open the Supabase project you want to use for Discovery Agent.
-2. Open **Connect** for the database.
-3. Choose the **Transaction pooler** connection string.
-4. Copy the complete PostgreSQL URL exactly as Supabase provides it.
-5. Do not commit the URL to GitHub, `render.yaml`, source code, screenshots, or documentation.
-
-The application accepts the normal Supabase `postgresql://...` URL and internally selects the Psycopg driver. Prepared statements are disabled for compatibility with transaction pooling.
-
-No manual schema SQL is required for the demo. On first successful startup, SQLModel creates the application tables if they do not already exist.
-
-Expected logical tables include:
-
-- `documentrecord`
-- `inventorysystem`
-- `usecase`
-- `gapreportrecord`
-- `generatedartifact`
-- `validationrun`
-
-Every persisted application record includes a `workspace_id` used for anonymous demo isolation.
-
-## 2. Rotate exposed credentials before deployment
-
-Any API key or database password that has been pasted into chat, committed, included in a screenshot, or shared elsewhere must be treated as exposed.
-
-Before deployment:
-
-- rotate the Gemini API key previously used during development if it was shared;
-- rotate any MongoDB password or URI previously shared;
-- rotate Groq credentials if they were exposed;
-- use a fresh Supabase database password if an earlier one was disclosed.
-
-Only the replacement credentials should be entered into Render.
-
-## 3. Push the deployment files to GitHub
-
-The repository includes `render.yaml`. Render uses it as a Blueprint.
-
-Important deployment files:
+## 2. Source-of-truth deployment files
 
 ```text
 render.yaml
 backend/Dockerfile
-requirements.txt
 backend/settings.py
 backend/main.py
 backend/core/security.py
+backend/core/provider_router.py
 backend/core/sandbox.py
 frontend/src/services/api.ts
+requirements.txt
+.github/workflows/ci.yml
 ```
 
-The backend Dockerfile is multi-stage: it builds the React frontend first and then copies the production frontend into the FastAPI image. This gives the demo one public origin and one Render service.
-
-## 4. Create the Render Blueprint
-
-1. Sign in to Render.
-2. Create a new **Blueprint**.
-3. Connect the GitHub repository containing Discovery Agent.
-4. Render will detect `render.yaml`.
-5. Choose/create the `discovery-agent-demo` service.
-6. Keep the Free plan for portfolio/demo use.
-
-The Blueprint is configured to deploy only after repository CI checks pass.
-
-## 5. Enter secret environment variables
-
-Render will request values for variables marked `sync: false`.
-
-### Required
-
-```text
-DISCOVERY_DATABASE_URL
-GEMINI_API_KEY
-```
-
-Set `DISCOVERY_DATABASE_URL` to the exact Supabase transaction-pooler PostgreSQL URL.
-
-Set `GEMINI_API_KEY` to a fresh Gemini API key.
-
-### Optional fallback
-
-```text
-DISCOVERY_GROQ_API_KEY
-```
-
-If Groq is omitted or rate limited, the application can still use Gemini and ultimately deterministic fallback behavior.
-
-### Automatically configured by the Blueprint
-
-The repository already configures these safe production values:
+`render.yaml` is the deployment contract. The current Blueprint configures:
 
 ```text
 DISCOVERY_ENVIRONMENT=production
@@ -141,174 +78,424 @@ DISCOVERY_RATE_LIMIT_ENABLED=true
 DISCOVERY_RETAIN_UPLOADS=false
 DISCOVERY_VALIDATION_MODE=static
 DISCOVERY_MAX_UPLOAD_BYTES=10485760
+DISCOVERY_ALLOWED_HOSTS=*.onrender.com
+DISCOVERY_CORS_ORIGINS=
 DISCOVERY_LLM_PROVIDER_ORDER=gemini,groq
+DISCOVERY_GEMINI_MODEL=gemini-3.5-flash-lite
 ```
 
-`DISCOVERY_SESSION_SECRET` is generated by Render rather than stored in Git.
+`DISCOVERY_SESSION_SECRET` is generated by Render and is not stored in Git.
 
-## 6. Security behavior in the public demo
+---
 
-### Anonymous workspace isolation
+## 3. Secrets and credentials
 
-Each browser receives an HTTP-only signed workspace cookie. Database queries are scoped to the workspace ID, so visitors do not share inventory, documents, use cases, gap reports, artifacts, or validation history.
-
-This is demo isolation, not full user authentication. A future production SaaS version should replace or supplement it with authenticated identities and database-level tenant controls.
-
-### Security headers
-
-Responses include controls such as:
-
-- `X-Content-Type-Options: nosniff`
-- `X-Frame-Options: DENY`
-- restrictive referrer policy
-- restricted browser permissions
-- HSTS in production
-- Content Security Policy in production
-
-### Upload privacy
-
-Public demo behavior is:
+The live service requires secret values configured directly in Render:
 
 ```text
-upload -> temporary local file -> parse/OCR -> redact -> extract -> persist redacted text -> delete original
+DISCOVERY_DATABASE_URL
+GEMINI_API_KEY
+DISCOVERY_GROQ_API_KEY   # optional fallback
 ```
 
-This avoids depending on Render's ephemeral filesystem for durable uploads and reduces retention of user-provided source documents.
+Never put real values in:
 
-### Rate limits
+- Git commits;
+- README/documentation;
+- `render.yaml`;
+- frontend `VITE_*` variables;
+- screenshots;
+- issue trackers;
+- chat messages.
 
-Expensive/mutating routes have per-workspace request limits, including document upload, goal discovery, gap analysis, connector generation, validation, and provider verification.
+Any credential pasted into chat, logs, screenshots, or source control must be treated as exposed and rotated.
 
-The current limiter is process-memory based and is appropriate for the single-instance free demo. A scaled production deployment should use Redis or another shared rate-limit store.
+---
 
-### Generated connector safety
+## 4. Supabase PostgreSQL
 
-The public service runs with:
+### Current connection profile
+
+The deployed demo is compatible with the Supabase PostgreSQL pooler. The application accepts a normal `postgresql://...` URL and normalizes it to the Psycopg SQLAlchemy driver internally.
+
+The currently used public-hosting pattern is the Supabase pooler endpoint rather than local SQLite. Transaction-pooler deployments use port `6543`; the project disables prepared statements when using pooled PostgreSQL connections.
+
+Do not document or commit the project reference, database password, or complete database URI.
+
+### Why PostgreSQL
+
+Discovery Agent already uses SQLModel/SQLAlchemy and relational records. PostgreSQL preserves the model/session/query architecture and provides durable hosted persistence. MongoDB would require a persistence rewrite without a clear project benefit.
+
+### Tables
+
+The application creates/uses logical tables including:
+
+- `documentrecord`
+- `inventorysystem`
+- `usecase`
+- `gapreportrecord`
+- `generatedartifact`
+- `validationrun`
+
+Deployment-era records include `workspace_id` for anonymous visitor isolation. `DocumentRecord` also stores redacted extracted text and upload-retention state.
+
+### Production startup guard
+
+Production startup intentionally fails when `DISCOVERY_DATABASE_URL` points to SQLite. Render's filesystem is ephemeral, so persistent application state must use PostgreSQL.
+
+---
+
+## 5. Anonymous workspace isolation
+
+The public demo does not require users to create accounts. Instead, `backend/core/security.py` creates a random workspace ID and signs it with HMAC-SHA256 using `DISCOVERY_SESSION_SECRET`.
+
+Cookie properties in production:
+
+```text
+HttpOnly = true
+Secure   = true
+SameSite = Lax
+Max age  = 30 days
+Path     = /
+```
+
+Database queries and relevant temporary/generated filesystem paths are scoped by workspace ID.
+
+This prevents normal visitors from seeing each other's inventory, documents, use cases, gap reports, artifacts, and validations.
+
+This is **demo isolation**, not full identity/RBAC. A production SaaS should add authenticated users, organizations, authorization and database-level tenant controls.
+
+---
+
+## 6. Rate limiting
+
+Expensive or destructive endpoints use per-workspace/client in-memory limits, including:
+
+| Endpoint | Current limit |
+|---|---:|
+| `POST /documents/upload` | 6/hour |
+| `POST /use-cases` | 30/hour |
+| `POST /use-cases/discover` | 10/hour |
+| `POST /gap-analysis` | 30/hour |
+| `POST /generate-connectors` | 10/hour |
+| `POST /validate` | 20/hour |
+| `POST /integrations/llm/verify` | 20/hour |
+| `DELETE /inventory` | 10/hour |
+
+The limiter is suitable for the current single-instance demo. Multi-instance production would require a shared store such as Redis or gateway-level rate limiting.
+
+---
+
+## 7. Upload privacy and retention
+
+The live service runs with:
+
+```text
+DISCOVERY_RETAIN_UPLOADS=false
+```
+
+Hosted flow:
+
+```text
+upload
+  -> temporary workspace file
+  -> parse / OCR
+  -> limited pattern redaction
+  -> system extraction
+  -> persist redacted extracted text + structured records
+  -> delete original upload
+```
+
+Current redaction targets email addresses, phone numbers and IPv4-style addresses. It must not be described as comprehensive PII anonymization.
+
+---
+
+## 8. Generated connector validation
+
+Production runtime validation requires:
 
 ```text
 DISCOVERY_VALIDATION_MODE=static
 ```
 
-Generated connector code is syntax-checked but never executed by the hosted demo.
+Hosted validation performs syntax/static checks:
 
-Local development can continue to use the hardened Docker validation mode. Do not enable host execution on a public service.
+- Python: `py_compile`
+- Node.js: `node --check`
 
-## 7. First deployment smoke test
+Generated code is **not executed** by the public Render service.
 
-After Render reports a successful deploy, check these in order.
+Local development supports two additional modes:
 
-### Readiness
+- `docker` - preferred local execution mode with network disabled and resource/security restrictions;
+- `local` - trusted development only; executes on the host.
 
-Open:
+Production startup rejects `docker` and `local` modes by design.
+
+---
+
+## 9. AI provider resilience
+
+The Render Blueprint sets:
 
 ```text
-https://<your-render-service>.onrender.com/ready
+DISCOVERY_LLM_PROVIDER_ORDER=gemini,groq
 ```
 
-Expected:
+Runtime order:
+
+```text
+Gemini
+  -> failure / quota / unusable output
+Groq
+  -> failure / quota / unusable output
+Deterministic fallback
+```
+
+Provider status can be inspected through `/health` and verified through `/integrations/llm/verify` without returning secret values.
+
+The deterministic path is important because the core project should remain demonstrable even when free AI quotas are exhausted.
+
+---
+
+## 10. Build and deployment pipeline
+
+### GitHub CI
+
+On push/pull request, CI validates:
+
+1. backend Pytest;
+2. backend compile check;
+3. Python sandbox image build;
+4. Docker sandbox connector validation;
+5. frontend dependency install;
+6. ESLint;
+7. Vitest;
+8. frontend production build;
+9. backend/frontend container builds;
+10. Docker Compose config validation.
+
+### Render
+
+`render.yaml` uses:
+
+```text
+autoDeployTrigger: checksPass
+```
+
+so Render waits for repository checks before automatically replacing the deployed service.
+
+### Single-service image
+
+`backend/Dockerfile`:
+
+1. builds React in a Node 22 stage;
+2. installs Python dependencies in Python 3.12 slim;
+3. installs Tesseract and Node runtime support;
+4. copies React `dist/` into the backend image;
+5. creates a non-root `appuser`;
+6. starts Uvicorn on Render's `$PORT`.
+
+---
+
+## 11. Liveness, health and readiness
+
+### Live application
+
+```text
+https://discovery-agent-demo.onrender.com/
+```
+
+### Platform liveness
+
+Render and the Docker image use:
+
+```text
+https://discovery-agent-demo.onrender.com/healthz
+```
+
+Expected payload:
+
+```json
+{"status":"alive"}
+```
+
+This endpoint is intentionally independent of PostgreSQL. A temporary Supabase outage must not cause Render to kill an otherwise healthy web process.
+
+### Database readiness
+
+```text
+https://discovery-agent-demo.onrender.com/ready
+```
+
+Expected when PostgreSQL is reachable and initialized:
 
 ```json
 {"status":"ready"}
 ```
 
-### Application
+If the database is unavailable, `/ready` returns HTTP 503.
 
-Open the root Render URL. The React application should load from the same FastAPI service.
-
-### Trust & Runtime panel
-
-The dashboard should report approximately:
+### Health/runtime metadata
 
 ```text
-Persistence             Managed PostgreSQL
-Workspace boundary      Isolated workspace
-AI execution            GEMINI configured/connected
-Generated validation    Static-only hosted mode
-Privacy                  Original uploads removed after extraction
+https://discovery-agent-demo.onrender.com/health
 ```
 
-### Functional demo
-
-Use the professional sample enterprise document and verify:
-
-1. upload succeeds;
-2. system inventory is populated;
-3. evidence and confidence are visible;
-4. an Invoice Automation use case can be created;
-5. Salesforce and NetSuite map as available when discovered;
-6. Stripe maps as missing when not present in the source estate;
-7. a connector scaffold can be generated;
-8. validation reports static-only hosted validation;
-9. reports remain visible after a Render restart because records live in Supabase PostgreSQL.
-
-## 8. Recommended demo script
-
-For interviews or portfolio demonstrations:
+`/health` always returns safe runtime/provider metadata. Its top-level status is `healthy` when PostgreSQL responds and `degraded` when the database is unavailable. In production, runtime status should reflect approximately:
 
 ```text
-1. Upload enterprise architecture document
-2. Show discovered systems + source evidence
-3. Explain confidence / human-review indicators
-4. Auto-discover or create an automation goal
-5. Run gap analysis
-6. Show missing integration and dependency path
-7. Generate connector scaffold
-8. Show static validation result
-9. Open Trust & Runtime panel
-10. Explain Gemini -> Groq -> deterministic failover
+environment              production
+validation_mode          static
+workspace_isolation      true
+rate_limits              true
+original_upload_retention false
+database                 postgresql
+privacy_mode             ephemeral-originals
 ```
 
-This sequence demonstrates the project's differentiators: evidence-backed discovery, hybrid AI/deterministic reasoning, integration planning, safe code generation, and explicit trust controls.
+---
 
-## 9. Troubleshooting
+## 12. Post-deployment smoke test
 
-### Database connection fails
+After every material deployment change:
 
-- Re-copy the **Transaction pooler** URL from Supabase.
-- Do not manually add angle brackets around the password.
-- Prefer the exact URL generated by Supabase instead of constructing it yourself.
-- Confirm the Supabase project is active.
+1. Open `/healthz` and confirm `{"status":"alive"}`.
+2. Open `/ready` and confirm PostgreSQL readiness.
+3. Open `/health` and confirm PostgreSQL/runtime state is healthy.
+4. Open the main UI.
+5. Upload a non-sensitive sample enterprise document.
+6. Confirm discovered systems and evidence appear.
+7. Create or auto-discover a use case.
+8. Run gap analysis.
+9. Generate one connector scaffold.
+10. Confirm validation explicitly reports static hosted validation.
+11. Open Reports and confirm records persist.
+12. Open an incognito/private browser and confirm it receives a separate empty workspace.
 
-### Render says production cannot use SQLite
+Recommended demonstration scenario:
 
-`DISCOVERY_DATABASE_URL` is missing or incorrect. Production intentionally refuses to start on local SQLite because Render's free filesystem is ephemeral.
+```text
+Architecture document mentions Salesforce + NetSuite
+        |
+        v
+Invoice Automation requires Salesforce + NetSuite + Stripe
+        |
+        v
+Salesforce  AVAILABLE
+NetSuite    AVAILABLE
+Stripe      MISSING
+        |
+        v
+Generate Stripe connector scaffold
+        |
+        v
+Static validation
+```
 
-### Workspace isolation configuration error
+---
 
-Ensure Render generated `DISCOVERY_SESSION_SECRET`. The service intentionally refuses to start with workspace isolation enabled and no signing secret.
+## 13. Redeploying safely
 
-### Connector validation says static-only
+Normal update flow:
 
-That is expected in the hosted demo. It is a security property, not an error.
+```bash
+git checkout -b feature/<change>
+python scripts/verify.py
+git add <reviewed files>
+git commit -m "<clear message>"
+git push
+```
 
-### Gemini quota exceeded
+After CI passes, Render can deploy the updated `main` revision according to the configured Blueprint policy.
 
-The provider router attempts the next configured provider. If all external providers fail, deterministic extraction/mapping remains available where supported.
+Before pushing deployment changes, verify that no `.env`, database URL, API key, generated upload, or local database file is staged.
+
+---
+
+## 14. Troubleshooting
+
+### `Name or service not known` from Psycopg
+
+This is a DNS/hostname failure, not a password failure.
+
+Check:
+
+- `DISCOVERY_DATABASE_URL` contains the exact Supabase pooler hostname;
+- no documentation placeholder such as `<host>` remains;
+- no quotes/spaces were accidentally included;
+- the pooler project is active.
+
+### `password authentication failed`
+
+DNS is working but credentials are wrong. Re-copy the Supabase connection string or rotate the database password and update the Render secret.
+
+### Production refuses SQLite
+
+This is intentional. Configure Supabase/PostgreSQL through `DISCOVERY_DATABASE_URL`.
+
+### Workspace isolation requires a session secret
+
+Ensure `DISCOVERY_SESSION_SECRET` exists. The Blueprint normally generates it automatically.
+
+### Connector validation says runtime execution was skipped
+
+Expected. The public service uses static-only validation deliberately.
+
+### Gemini is unavailable or quota-limited
+
+The provider router attempts Groq next. If configured providers fail, deterministic fallback is used where supported.
 
 ### First request is slow
 
-Free Render web services may spin down when inactive. A cold-start delay is expected for a free portfolio deployment.
+Render Free services can cold-start after inactivity. Warm the URL before a live interview/demo.
 
-## 10. Production evolution beyond the free demo
+### Uploaded original is not present after processing
 
-A real multi-user enterprise deployment should add:
+Expected in the public demo. `DISCOVERY_RETAIN_UPLOADS=false` intentionally deletes originals after redacted extraction.
+
+---
+
+## 15. Current verified quality state
+
+Latest local verification after deployment hardening:
+
+```text
+Backend Pytest             18 / 18 passed
+Backend compile check      passed
+Frontend ESLint            passed
+Frontend Vitest             5 / 5 passed
+Frontend TypeScript build  passed
+Frontend Vite build        passed
+```
+
+After redeployment, confirm `/healthz`, `/ready`, and `/health` against the live Render service before treating the runtime as validated.
+
+---
+
+## 16. Production evolution beyond the portfolio demo
+
+For a real multi-user enterprise product, add:
 
 - authenticated users and organizations;
-- Supabase Auth or another OIDC provider;
-- database-level tenant/RLS enforcement where appropriate;
-- Alembic-managed migrations;
-- Redis-backed distributed rate limiting;
-- managed object storage with explicit retention policies when original document retention is required;
-- centralized structured logs and tracing;
-- a separate isolated sandbox worker for runtime connector execution;
-- malware scanning and deeper document security controls;
-- calibrated extraction evaluation and monitoring;
-- paid/enterprise LLM data-processing arrangements for confidential documents.
+- RBAC/ABAC and database-level tenant enforcement/RLS;
+- Alembic-managed schema migrations;
+- distributed rate limiting;
+- structured logs, metrics, traces, dashboards and alerts;
+- durable audit retention;
+- managed object storage when original-file retention is required;
+- malware/document scanning;
+- a dedicated isolated sandbox worker if hosted runtime execution is introduced;
+- stronger PII classification/redaction;
+- formal LLM/data-processing agreements for confidential enterprise documents;
+- backup/recovery and availability objectives appropriate to the product SLA.
 
-## Official references
+---
+
+## 17. Official references
 
 - Supabase database connections: https://supabase.com/docs/guides/database/connecting-to-postgres
 - Render Blueprints: https://render.com/docs/infrastructure-as-code
 - Render Blueprint specification: https://render.com/docs/blueprint-spec
-- Render environment variables and secrets: https://render.com/docs/configure-environment-variables
+- Render environment variables: https://render.com/docs/configure-environment-variables
 - Render free services: https://render.com/docs/free

@@ -20,7 +20,7 @@ Large organizations often have many software systems: CRM platforms, ERP platfor
 
 Discovery Agent turns operational documents into an evidence-backed system inventory, maps business goals against that inventory, identifies integration gaps, generates connector scaffolds, and validates generated code.
 
-The project is best described as a **production-oriented enterprise integration discovery prototype**. It has real engineering controls and automated tests, but it does not yet include all controls required for an internet-facing multi-user production service.
+Discovery Agent is now a **live, production-oriented engineering portfolio system** with a hardened public-demo profile. The deployed application is available at `https://discovery-agent-demo.onrender.com/` and uses Render for hosting, Supabase PostgreSQL for durable state, signed anonymous workspace isolation, per-workspace rate limits, and static-only hosted connector validation. It remains intentionally distinct from a full enterprise SaaS: authenticated identity/RBAC, managed migrations, distributed rate limiting, deep observability, and a dedicated remote execution sandbox are still future production controls.
 
 ---
 
@@ -29,27 +29,35 @@ The project is best described as a **production-oriented enterprise integration 
 ```mermaid
 flowchart LR
     U[Browser / React UI]
-    A[FastAPI API]
+    A[FastAPI on Render]
     I[Document Ingestor]
-    R[Redaction]
+    R[Limited Pattern Redaction]
     E[System Extractor]
-    DB[(SQLite via SQLModel)]
+    PR[Gemini / Groq Provider Router]
+    DB[(Supabase PostgreSQL via SQLModel)]
     M[Gap Mapping Engine]
     G[Connector Generator]
-    S[Docker Validation Sandbox]
+    S[Static Hosted Validation]
 
-    U -->|HTTP / JSON / multipart| A
+    U -->|same-origin HTTPS| A
     A --> I
     I --> R
     R --> E
+    E <--> PR
     E --> DB
     A --> M
     M --> DB
     A --> G
+    G <--> PR
     G --> S
     G --> DB
-    A -->|JSON responses| U
+    A -->|JSON + static frontend| U
 ```
+
+The repository supports two operating profiles:
+
+- **Local development:** SQLite by default, Vite on port 5173, FastAPI on port 8000, and Docker sandbox validation when Docker is available.
+- **Live public demo:** one Render Docker service serves both React and FastAPI, Supabase PostgreSQL stores durable state, originals are deleted after redacted extraction, anonymous workspaces are signed and isolated, and generated code receives static syntax validation only.
 
 ### Core idea
 
@@ -70,7 +78,7 @@ sequenceDiagram
     participant ING as Ingestor
     participant RED as Redactor
     participant EXT as Extractor
-    participant DB as SQLModel / SQLite
+    participant DB as SQLModel / PostgreSQL or SQLite
 
     UI->>API: POST /documents/upload (multipart file)
     API->>API: Validate filename, extension, size
@@ -408,25 +416,21 @@ ORMs reduce repetitive SQL, but engineers still need to understand database conc
 
 ---
 
-## 16. What is SQLite?
+## 16. What databases are used?
 
-**SQLite** is a relational database stored in a local file.
+Discovery Agent deliberately uses different persistence profiles for local development and the live demo.
 
-Discovery Agent uses SQLite by default, with a database URL pointing to a file under `backend/`.
+### Local development: SQLite
 
-Advantages for this project:
+SQLite is a relational database stored in a local file. It remains the default because it requires no external database server and makes local development and tests reproducible.
 
-- zero external database server required;
-- simple local demonstrations;
-- reproducible development.
+### Live deployment: Supabase PostgreSQL
 
-Limitations for a larger production deployment:
+The public Render deployment uses managed PostgreSQL provided by Supabase. The application keeps the same SQLModel/SQLAlchemy persistence layer, so moving from local SQLite to hosted PostgreSQL does not require a separate document-database architecture.
 
-- limited concurrent-write behavior compared with server databases;
-- local-file persistence does not naturally scale across many application replicas;
-- schema migrations still need formal management.
+The deployed database URL is supplied through `DISCOVERY_DATABASE_URL`; credentials are stored in Render environment secrets, never in source control. Production startup intentionally rejects SQLite because Render's free filesystem is ephemeral.
 
-A production evolution could use PostgreSQL while preserving most SQLModel concepts.
+This dual-profile design provides low-friction local development while using durable server-side relational persistence for the public demo. Formal schema migrations are still a future improvement.
 
 ---
 
@@ -680,39 +684,46 @@ Generic matches receive lower confidence and require human review.
 
 **LLM — Large Language Model** — is a model trained to generate and interpret natural-language/token sequences.
 
-Discovery Agent can optionally call Groq-hosted model inference through:
+Discovery Agent can optionally call external LLM providers through a provider-routing layer:
 
 ```text
+backend/core/provider_router.py
+backend/core/gemini_provider.py
 backend/core/llm.py
 ```
 
-Provider configuration is optional.
+The router currently supports Gemini and Groq. Provider configuration is optional; if no configured provider returns a usable result, the application continues through deterministic fallback behavior.
 
-If no Groq client is configured, `call_llm` returns `None` and the application continues using deterministic fallback behavior.
-
-This is important operationally: the core discovery workflow is not completely dependent on an external model provider.
+This is important operationally: core discovery, mapping, and scaffold generation are not completely dependent on one vendor or one external model API.
 
 ---
 
-## 28. What is Groq in this project?
+## 28. How does LLM provider routing work?
 
-Groq is the configured model API provider.
-
-Important environment values include:
+`backend/core/provider_router.py` defines the supported providers and their failover order. Development defaults can differ, but the live Render Blueprint explicitly uses:
 
 ```text
+DISCOVERY_LLM_PROVIDER_ORDER=gemini,groq
+```
+
+The deployed sequence is therefore:
+
+```text
+Gemini -> Groq -> deterministic fallback
+```
+
+Relevant configuration includes:
+
+```text
+GEMINI_API_KEY
+DISCOVERY_GEMINI_MODEL
 DISCOVERY_GROQ_API_KEY
 DISCOVERY_GROQ_MODEL
+DISCOVERY_LLM_PROVIDER_ORDER
 DISCOVERY_LLM_TIMEOUT_SECONDS
 ```
 
-The default model configured in settings is currently:
-
-```text
-openai/gpt-oss-120b
-```
-
-The key is read server-side. The backend status API must never return the secret itself.
+Provider credentials are read server-side. `/health` exposes only safe configuration/status metadata; it must never return secret values.
 
 ---
 
@@ -724,15 +735,15 @@ Discovery Agent uses this pattern heavily.
 
 ### Extraction
 
-1. Attempt provider-assisted extraction.
-2. Validate that proposed system names are supported by source text.
-3. If the provider is unavailable or extraction fails, run deterministic extraction.
+1. Ask configured providers in failover order.
+2. Validate proposed system names against source evidence.
+3. If providers are unavailable, quota-limited, or return unusable output, run deterministic extraction.
 
 ### Connector generation
 
-1. Attempt LLM-generated artifact.
-2. Validate it.
-3. If validation fails, return deterministic Python/Node scaffold templates.
+1. Ask configured providers in failover order for a generated artifact.
+2. Validate the resulting scaffold according to the active validation mode.
+3. If provider generation is unavailable or unusable, return deterministic Python/Node scaffold templates.
 
 Fallback design improves resilience and demo reproducibility.
 
@@ -1022,23 +1033,21 @@ backend/core/sandbox.py
 
 ---
 
-## 44. What is a sandbox?
+## 44. What validation modes exist?
 
-A **sandbox** is a restricted execution environment.
+Discovery Agent supports three explicit validation modes:
 
-Discovery Agent defaults to Docker-based validation:
+### `static` - public hosted mode
 
-```text
-DISCOVERY_VALIDATION_MODE=docker
-```
+Used by the live Render deployment. Python artifacts are checked with `py_compile`; Node.js artifacts are checked with `node --check`. Generated code and tests are **not executed**. Production runtime validation requires this mode.
 
-Development-only host execution can be explicitly enabled with:
+### `docker` - preferred local secure execution mode
 
-```text
-DISCOVERY_VALIDATION_MODE=local
-```
+Generated artifacts execute inside a constrained Docker container with networking disabled and resource limits applied. This is the default development validation mode when Docker is available.
 
-Local mode should only be used for trusted development artifacts.
+### `local` - trusted development only
+
+Generated code executes on the host. This mode is intentionally explicit and should never be enabled on the public service.
 
 ---
 
@@ -1398,29 +1407,23 @@ TypeScript source -> Vite build -> static HTML/CSS/JS
 
 **Runtime** is when the deployed application is actually serving requests.
 
-The production frontend container does not need the Vite development server. It serves built static files with Nginx.
+The production build does not need the Vite development server. In the live Render profile, the backend Dockerfile builds the React application in a Node stage and copies `frontend/dist/` into the FastAPI image. FastAPI then serves the static application and API from the same origin.
 
 ---
 
-## 60. What is Nginx?
+## 60. How is the frontend served?
 
-**Nginx** is a high-performance web server/reverse proxy.
+The repository supports two production-style serving arrangements.
 
-In this repository it serves the built React frontend.
+### Live Render deployment
 
-Configuration:
+`backend/Dockerfile` is multi-stage. Node/Vite builds the frontend first, then the resulting `frontend/dist/` files are copied into the Python image. FastAPI serves those assets and the API from one Render origin. In production, the frontend API client defaults to same-origin requests.
 
-```text
-frontend/nginx.conf
-```
+### Local/Compose frontend image
 
-Container definition:
+`frontend/Dockerfile` and `frontend/nginx.conf` remain available for the two-container Docker Compose workflow. Nginx serves the built SPA in that profile.
 
-```text
-frontend/Dockerfile
-```
-
-The Nginx configuration includes SPA fallback behavior so frontend routes can return `index.html` when appropriate.
+The live portfolio deployment intentionally uses the single-service profile because it simplifies cookies, CORS, free-tier hosting, and operational ownership.
 
 ---
 
@@ -1525,20 +1528,31 @@ Local settings are loaded from the root `.env` file when present.
 
 | Variable | Purpose | Typical/default behavior |
 |---|---|---|
-| `DISCOVERY_DATABASE_URL` | Database connection | Local SQLite by default |
+| Variable | Purpose | Local / deployed behavior |
+|---|---|---|
+| `DISCOVERY_ENVIRONMENT` | Runtime profile | `development` locally; `production` on Render |
+| `DISCOVERY_DATABASE_URL` | SQLModel database connection | SQLite locally; Supabase PostgreSQL on Render |
 | `DISCOVERY_DATA_DIR` | Runtime data root | `backend/data` |
-| `DISCOVERY_GROQ_API_KEY` | Groq credential | Optional |
-| `DISCOVERY_GROQ_MODEL` | Model name | `openai/gpt-oss-120b` |
+| `GEMINI_API_KEY` | Gemini credential | Optional locally; configured on live demo |
+| `DISCOVERY_GEMINI_MODEL` | Gemini model | `gemini-3.5-flash-lite` in current Blueprint |
+| `DISCOVERY_GROQ_API_KEY` | Groq fallback credential | Optional |
+| `DISCOVERY_GROQ_MODEL` | Groq model | `openai/gpt-oss-120b` |
+| `DISCOVERY_LLM_PROVIDER_ORDER` | Provider failover order | Render uses `gemini,groq` |
 | `DISCOVERY_LLM_TIMEOUT_SECONDS` | Provider timeout | `30` seconds |
-| `DISCOVERY_CORS_ORIGINS` | Allowed browser origins | Local frontend by default |
-| `DISCOVERY_MAX_UPLOAD_BYTES` | Upload byte limit | 20 MB default in upload route |
-| `DISCOVERY_VALIDATION_MODE` | `docker` or trusted `local` | `docker` |
-| `DISCOVERY_PYTHON_SANDBOX_IMAGE` | Python validation image | `discovery-agent-python-sandbox:3.12` |
-| `DISCOVERY_NODE_SANDBOX_IMAGE` | Node validation image | `node:22-alpine` |
-| `DISCOVERY_SANDBOX_MEMORY` | Sandbox memory limit | `256m` |
-| `DISCOVERY_SANDBOX_CPUS` | Sandbox CPU limit | `1.0` |
-| `DISCOVERY_SANDBOX_PIDS` | Sandbox process limit | `128` |
-| `VITE_API_URL` | Frontend API base URL at build/dev time | `http://localhost:8000` fallback |
+| `DISCOVERY_SESSION_SECRET` | Signs anonymous workspace cookie | Required when workspace isolation is enabled; generated by Render |
+| `DISCOVERY_WORKSPACE_ISOLATION` | Scope data to signed workspace | `false` locally by default; `true` on Render |
+| `DISCOVERY_RATE_LIMIT_ENABLED` | Enable request quotas | `true` by default and on Render |
+| `DISCOVERY_RETAIN_UPLOADS` | Keep original source uploads | `true` locally by default; `false` on Render |
+| `DISCOVERY_ALLOWED_HOSTS` | Trusted HTTP hosts | Local hosts by default; `*.onrender.com` on Render |
+| `DISCOVERY_CORS_ORIGINS` | Browser cross-origin allow-list | Local Vite origins; empty/same-origin on live demo |
+| `DISCOVERY_MAX_UPLOAD_BYTES` | Upload byte limit | 20 MB default; Render Blueprint sets 10 MB |
+| `DISCOVERY_VALIDATION_MODE` | `static`, `docker`, or trusted `local` | `docker` locally; `static` on Render |
+| `DISCOVERY_PYTHON_SANDBOX_IMAGE` | Python Docker validation image | `discovery-agent-python-sandbox:3.12` |
+| `DISCOVERY_NODE_SANDBOX_IMAGE` | Node Docker validation image | `node:22-alpine` |
+| `DISCOVERY_SANDBOX_MEMORY` | Docker sandbox memory limit | `256m` |
+| `DISCOVERY_SANDBOX_CPUS` | Docker sandbox CPU limit | `1.0` |
+| `DISCOVERY_SANDBOX_PIDS` | Docker sandbox process limit | `128` |
+| `VITE_API_URL` | Optional frontend API override | Local dev can set it; production defaults to same origin |
 
 ---
 
@@ -1605,6 +1619,19 @@ Required checks:
 Compose configuration is also validated when a Compose CLI is available.
 
 Compose validation uses quiet mode so expanded environment secrets are not printed into verification logs.
+
+Current verified project state after deployment hardening:
+
+```text
+Backend tests                 18 / 18 passed
+Backend compile check         passed
+Frontend ESLint               passed
+Frontend Vitest                5 / 5 passed
+Frontend TypeScript build     passed
+Frontend Vite build           passed
+```
+
+The live deployment URL is `https://discovery-agent-demo.onrender.com/`.
 
 ---
 
@@ -1749,61 +1776,51 @@ That decision can be revisited if the application grows significantly.
 
 Current controls include:
 
-- normalized upload filenames;
-- allow-listed upload extensions;
+- normalized upload filenames and extension allow-listing;
 - bounded upload size;
-- configurable CORS;
-- server-side secrets;
-- limited email/phone/IP redaction;
+- server-side secrets and production runtime validation;
+- signed HMAC-SHA256 anonymous workspace cookies;
+- workspace-scoped database queries and filesystem paths;
+- per-workspace/client rate limits on expensive and destructive routes;
+- TrustedHost checks and same-origin public deployment;
+- production CSP, HSTS, frame denial, `nosniff`, referrer and permissions policies;
+- limited email/phone/IP redaction before persisted extracted text;
+- public-demo original upload deletion after processing;
 - non-root application container;
-- Docker-first generated-code validation;
-- disabled sandbox networking;
-- sandbox CPU/memory/PID limits;
-- read-only sandbox root filesystem;
-- dropped Linux capabilities;
-- no-new-privileges;
-- execution timeouts;
-- CI validation.
+- static-only generated-code validation on the public service;
+- Docker sandbox validation for local secure execution;
+- disabled Docker sandbox networking, CPU/memory/PID limits, read-only root, dropped capabilities, no-new-privileges, and timeouts;
+- CI validation and Render deploy-after-checks behavior.
 
 ---
 
-## 77. What is still missing for a public enterprise deployment?
+## 77. What is still missing beyond the public demo?
 
-Major remaining work includes:
+The current public demo is intentionally hardened for portfolio use, but a real enterprise SaaS still needs additional controls.
 
-### Authentication
+### Authenticated identity and authorization
 
-Who is the user?
+Signed anonymous workspaces isolate browser sessions, but they are not user accounts. A production service should add an identity provider, organizations/tenants, RBAC, and database-level authorization/RLS where appropriate.
 
-### Authorization
+### Managed database migrations
 
-What is that user allowed to read, create, generate, or delete?
+The demo can create tables and compatibility columns, but production schema evolution should use a migration system such as Alembic.
 
-### Rate limiting
+### Distributed abuse controls
 
-How many requests can one caller issue?
+The current limiter is in-process and appropriate for a single free instance. Multi-instance deployments need a shared limiter/store such as Redis or an API gateway.
 
-### Database migrations
+### Observability and audit retention
 
-How are schema changes deployed safely over time?
+Production teams need structured logs, metrics, tracing, dashboards, alerts, and durable audit trails. Request IDs already provide a foundation.
 
-A tool such as Alembic would normally be considered.
+### Dedicated sandbox execution service
 
-### Observability
+The public demo intentionally does not execute generated code. If runtime execution becomes a product feature, it should move to a separate isolated worker/service rather than the public API host.
 
-Production teams need structured logs, metrics, tracing, request IDs, dashboards, and alerting.
+### Stronger document security and privacy controls
 
-### Dedicated sandbox service
-
-Generated-code execution should be separated from the main application process/container.
-
-### Secret management
-
-Production secrets should normally come from a secret manager or deployment platform, not a developer `.env` file.
-
-### Stronger PII controls
-
-Current redaction is limited and should not be treated as a complete privacy subsystem.
+Current redaction is intentionally limited. Enterprise use would require deeper PII classification, malware/file scanning, retention policies, data-processing agreements, and potentially encrypted managed object storage.
 
 ---
 
@@ -1856,29 +1873,31 @@ python scripts/dev.py --check
 Check:
 
 1. backend is running;
-2. `VITE_API_URL` points to the correct backend;
-3. `DISCOVERY_CORS_ORIGINS` includes the frontend origin;
-4. browser console/network errors;
-5. `/health` responds.
+2. in local development, `VITE_API_URL` points to the correct backend when overridden;
+3. local `DISCOVERY_CORS_ORIGINS` includes the Vite origin;
+4. in production, the frontend should use same-origin API requests rather than a separate API URL;
+5. browser console/network errors;
+6. `/healthz` returns liveness, `/health` reports runtime state, and `/ready` confirms database readiness.
 
 ---
 
-## 81. Groq is not connected
+## 81. An LLM provider is not connected
 
-The application can still use deterministic fallback.
+The application can still use the next configured provider and ultimately deterministic fallback.
 
-To use Groq, verify:
+Check the active failover order and relevant variables:
 
 ```text
+DISCOVERY_LLM_PROVIDER_ORDER
+GEMINI_API_KEY
+DISCOVERY_GEMINI_MODEL
 DISCOVERY_GROQ_API_KEY
 DISCOVERY_GROQ_MODEL
 ```
 
-Use the UI provider-verification action or backend verification endpoint.
+Use `/integrations/llm/verify` or the UI verification action to test configured providers without exposing credentials.
 
-Never print or commit the API key.
-
-If a credential is accidentally exposed in logs or chat output, rotate/revoke it and create a new credential.
+Never print or commit API keys. If a credential is exposed in logs, screenshots, source control, or chat, rotate/revoke it and update the deployment secret.
 
 ---
 
@@ -1922,9 +1941,9 @@ Executing generated code on the API host is dangerous. Docker provides process/f
 
 Containers share the host kernel and Docker-daemon access is powerful. A production architecture should separate sandbox execution from the main API and minimize the worker's permissions.
 
-## 88. Why SQLite?
+## 88. Why SQLite locally and PostgreSQL in deployment?
 
-It gives a zero-infrastructure local database suitable for prototyping, tests, and portfolio demonstration. A horizontally scaled deployment would likely move to a server database such as PostgreSQL and add migrations.
+SQLite gives zero-infrastructure local development and fast tests. The live demo uses Supabase PostgreSQL because hosted persistence must survive Render restarts and support a server-backed relational model. SQLModel/SQLAlchemy allows both profiles to share the same application model layer. A larger production system would add managed migrations and tenant-level authorization controls.
 
 ## 89. Why refactor the frontend into pages/components?
 
@@ -1936,7 +1955,7 @@ The frontend does not receive backend stage events. Claiming “extracting,” t
 
 ## 91. What is the biggest next production improvement?
 
-For public deployment: authentication/authorization plus a dedicated sandbox worker are among the highest-priority architectural improvements. Migrations and observability should follow closely.
+The public demo is already deployed. The highest-value next step is authenticated identity + organization/tenant authorization, ideally with database-level tenant enforcement. After that, add managed migrations and observability. A dedicated remote sandbox worker becomes necessary only if executing generated connectors is promoted from local engineering capability to hosted product functionality.
 
 ---
 
@@ -1955,7 +1974,10 @@ For public deployment: authentication/authorization plus a dedicated sandbox wor
 | Pydantic | Runtime data parsing/validation library |
 | SQLModel | Typed ORM/model layer built on SQLAlchemy/Pydantic ideas |
 | ORM | Maps Python objects to database tables/rows |
-| SQLite | Local relational database file |
+| SQLite | Local-development relational database file |
+| PostgreSQL | Server relational database used by the live deployment |
+| Supabase | Managed PostgreSQL platform used for deployed durable state |
+| Render | Hosting platform for the live single-service demo |
 | Persistence | Storing data beyond one request/process operation |
 | Primary key | Unique row identifier |
 | Foreign key | Reference from one table to another |
@@ -1967,7 +1989,9 @@ For public deployment: authentication/authorization plus a dedicated sandbox wor
 | Evidence | Source text supporting a discovered system |
 | Deterministic | Rule-driven and reproducible execution path |
 | LLM | Large Language Model |
-| Groq | Optional model API provider used by the backend |
+| Gemini | Primary LLM provider in the current Render deployment order |
+| Groq | Optional/fallback LLM provider |
+| Provider router | Chooses configured LLM providers in failover order |
 | Fallback | Alternate path when primary path is unavailable |
 | Hallucination | Model-generated claim not supported by source evidence |
 | Heuristic | Rule-of-thumb score/logic, not calibrated probability |
@@ -1996,7 +2020,9 @@ For public deployment: authentication/authorization plus a dedicated sandbox wor
 | Vite | Frontend dev server and bundler |
 | Node.js | JavaScript runtime used by frontend tooling |
 | npm | Node package manager |
-| Nginx | Production static frontend web server |
+| Nginx | Static frontend server used by the optional separate frontend/Compose image |
+| Workspace isolation | Signed anonymous browser boundary used to scope deployed demo data |
+| Static validation | Hosted syntax-only validation that intentionally does not execute generated code |
 | Build | Transform source into deployable artifacts |
 | Runtime | Period when the deployed program is executing |
 | Lint | Static source-quality analysis |
@@ -2025,7 +2051,9 @@ If you are learning this repository for a presentation or interview, use this or
 8. Learn every Docker sandbox hardening control and why it exists.
 9. Explain the React page/component/API-client separation.
 10. Run `python scripts/dev.py --check` and `python scripts/verify.py` yourself.
-11. Be able to name the current production limitations without trying to hide them.
+11. Explain the difference between local SQLite/Docker mode and the live Render/Supabase/static-validation mode.
+12. Explain Gemini -> Groq -> deterministic fallback.
+13. Be able to name the remaining enterprise-production limitations without trying to hide them.
 
 A strong project explanation is not “we used many technologies.” It is:
 
