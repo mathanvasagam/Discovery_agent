@@ -6,25 +6,9 @@
 
 Turn unstructured enterprise documentation into an **evidence-backed system inventory**, identify **integration gaps**, and generate **validated connector scaffolds**.
 
-<p>
-  <a href="https://discovery-agent-demo.onrender.com/"><strong>Live Demo</strong></a>
-  ·
-  <a href="docs/TECHNICAL_GUIDE.md">Technical Guide</a>
-  ·
-  <a href="docs/DEPLOYMENT.md">Deployment Guide</a>
-</p>
-
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-Online-2ea44f?style=flat-square)](https://discovery-agent-demo.onrender.com/)
-[![CI](https://img.shields.io/github/actions/workflow/status/mathanvasagam/Discovery_agent/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/mathanvasagam/Discovery_agent/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688?style=flat-square&logo=fastapi&logoColor=white)
-![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=111111)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Supabase-4169E1?style=flat-square&logo=postgresql&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 </div>
 
----
 
 ## What Discovery Agent Does
 
@@ -363,25 +347,6 @@ Current limitations include:
 - local OCR quality depends on the source document and OCR environment
 
 These boundaries are documented intentionally rather than hidden behind a “production-ready” label.
-
----
-
-## Roadmap
-
-- [x] Evidence-backed multi-format system discovery
-- [x] Integration gap analysis
-- [x] Python / Node.js connector scaffolding
-- [x] Gemini/Groq provider failover
-- [x] PostgreSQL deployment persistence
-- [x] Public-demo workspace isolation and rate limits
-- [x] Hosted static validation
-- [ ] Authentication, organizations, and RBAC
-- [ ] Alembic-managed migrations
-- [ ] Distributed rate limiting
-- [ ] Structured audit trail and observability
-- [ ] Dedicated remote sandbox worker
-- [ ] Vendor-specific connector contract tests
-- [ ] Calibrated extraction benchmark dataset
 
 ---
 
