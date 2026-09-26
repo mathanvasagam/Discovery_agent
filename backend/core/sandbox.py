@@ -56,6 +56,16 @@ def _write_artifact(workspace: Path, artifact: Dict[str, Any]) -> Dict[str, Path
     return {"code": code_path, "tests": tests_path}
 
 
+def _ensure_workspace_accessible_for_container(workspace: Path) -> None:
+    try:
+        workspace.chmod(0o755)
+        for item in workspace.iterdir():
+            if item.is_file():
+                item.chmod(0o644)
+    except OSError as exc:
+        logger.warning("Could not normalize workspace permissions for container execution: %s", exc)
+
+
 def _run_command(command: List[str], cwd: Path, timeout_seconds: int = 20) -> Dict[str, Any]:
     try:
         process = subprocess.run(
@@ -93,6 +103,10 @@ def _docker_available(cwd: Path) -> bool:
 
 
 def _docker_exec(workspace: Path, image: str, inner_command: List[str]) -> Dict[str, Any]:
+    user_flags: List[str] = []
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        user_flags = ["--user", f"{os.getuid()}:{os.getgid()}"]
+
     command = [
         "docker",
         "run",
@@ -116,6 +130,7 @@ def _docker_exec(workspace: Path, image: str, inner_command: List[str]) -> Dict[
         f"{workspace.resolve()}:/workspace:rw",
         "-w",
         "/workspace",
+        *user_flags,
         image,
         "timeout",
         "15s",
@@ -253,6 +268,7 @@ def run_in_docker(code_artifact: Dict[str, Any], network_disabled: bool = True) 
     with tempfile.TemporaryDirectory(prefix="discovery-agent-validate-") as temp_dir:
         workspace = Path(temp_dir)
         paths = _write_artifact(workspace, code_artifact)
+        _ensure_workspace_accessible_for_container(workspace)
 
         if not _docker_available(workspace):
             return {
