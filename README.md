@@ -6,17 +6,9 @@
 
 Turn unstructured enterprise documentation into an **evidence-backed system inventory**, identify **integration gaps**, and generate **validated connector scaffolds**.
 
-<p>
-  <a href="https://discovery-agent-demo.onrender.com/"><strong>Live Demo</strong></a>
-  ·
-  <a href="docs/TECHNICAL_GUIDE.md">Technical Guide</a>
-  ·
-  <a href="docs/DEPLOYMENT.md">Deployment Guide</a>
-</p>
 
 </div>
 
----
 
 ## What Discovery Agent Does
 
